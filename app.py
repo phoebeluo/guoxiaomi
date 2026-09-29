@@ -4,6 +4,8 @@ from dotenv import load_dotenv
 from datetime import datetime
 import os
 import json
+from rag.load_docs import load_all_docs, DOCS_DIR
+
 load_dotenv()
 
 # 会话目录：基于本文件位置解析，避免从其它目录启动 streamlit 时路径错乱
@@ -63,9 +65,11 @@ def delete_session(session_name):
         if os.path.exists(session_path):
             os.remove(session_path)
             # 如果删除的是当前会话
-            st.session_state.messages=[]
-            st.session_state.current_session=generate_session_name()
-            st.rerun()
+            if session_name==st.session_state.current_session:
+                save_messages()
+                st.session_state.messages=[]
+                st.session_state.current_session=generate_session_name()
+                st.rerun()
     except Exception as e:
         st.error(f"删除会话失败：{e}")
 # ————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
@@ -92,6 +96,13 @@ if "character" not in st.session_state:
 if "current_session" not in st.session_state:
     st.session_state.current_session = generate_session_name()
 
+# 知识库全文（P0 全量注入基线）
+# 必须用 @st.cache_data：Streamlit 每次用户交互都会把整个脚本重跑一遍，
+# 不加缓存的话，用户每问一个问题就要重读 44 个文件
+@st.cache_data
+def get_docs_context():
+    content, count, chars = load_all_docs(DOCS_DIR)
+    return content
 
 
 # 系统提示词
@@ -185,7 +196,6 @@ with st.sidebar:
         with col2:
             if st.button(session,width="stretch",icon="❌️",key=f"delete_{session}"):
                 delete_session(session)
-                st.rerun()
 
     st.divider()
 
@@ -210,10 +220,21 @@ if prompt:
 
 
     # 与AI大模型进行交互
+    # 用 replace 而不是 format：str.format 会把语料里的 {} 当作占位符去解析，
+    # 一旦语料中出现 JSON 示例或模板语法就会抛 KeyError。
+    # replace 只精确替换这两个字符串，语料内容不会被误伤。
+    # 语料拼在系统提示词之后、位于 messages 最前，保证前缀固定可命中 cache
+    system_content = (
+        system_prompt
+        .replace("{name}", st.session_state.nickname)
+        .replace("{character}", st.session_state.character)
+        + "\n\n## 知识库全文\n\n"
+        + get_docs_context()
+    )
     response = client.chat.completions.create(
         model=os.environ.get('LLM_MODEL', 'deepseek-v4-pro-0813'),
         messages=[
-            {"role": "system", "content": system_prompt.format(name=st.session_state.nickname,character=st.session_state.character)},
+            {"role": "system", "content": system_content},
             *st.session_state.messages
         ],
         stream=True,
