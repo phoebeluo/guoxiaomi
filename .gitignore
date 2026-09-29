@@ -1,0 +1,9 @@
+.env
+__pycache__/
+results/*.npy
+data/sessions/
+.idea/
+*.pyc
+.venv/
+.pytest_cache/
+
