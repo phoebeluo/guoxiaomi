@@ -2,6 +2,7 @@
 __pycache__/
 results/*.npy
 data/sessions/
+data/logs/
 .idea/
 *.pyc
 .venv/

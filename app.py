@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 from datetime import datetime
 import os
 import json
+import time
 from rag.load_docs import load_all_docs, DOCS_DIR
 
 load_dotenv()
@@ -82,6 +83,54 @@ def recent_messages(messages,max_count):
     while tail and tail[0]["role"]!="user":
         tail.pop(0)
     return tail
+
+
+# 请求记录目录：与 data/sessions 同级，同样基于本文件位置解析
+LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "logs")
+
+# 错误分类表：按本项目**实际撞到过**的异常特征归类，不是凭空猜的。
+# 为什么要分类：分类后才能给不同降级话术，也才能统计「哪类错误最常见」。
+# 顺序有意义：quota 放最前，避免 403 携带的其它关键字被后面的分支抢走。
+ERROR_KINDS = (
+    ("quota",      ("403", "quota", "Free quota exhausted", "Arrearage", "欠费", "额度")),
+    ("timeout",    ("Timeout", "timeout", "APITimeoutError")),
+    ("connection", ("APIConnectionError", "ConnectionError", "Connection error")),
+    ("content",    ("data_inspection", "DataInspection", "400", "invalid")),
+)
+
+# 降级话术：出错时给用户一句**人话**，而不是原始异常。
+# ⚠️ 不暴露内部原因（尤其不暴露「额度」）—— 这也是本项目的对客约束。
+FALLBACK_TEXT = {
+    "quota":      "果小蜜这会儿有点忙不过来，稍等一下再来问我呀～🍈",
+    "timeout":    "刚才网络有点慢，麻烦您再发一次哦～",
+    "connection": "刚才网络有点慢，麻烦您再发一次哦～",
+    "content":    "这个果小蜜不太方便答，我们聊聊水果吧～🍈",
+    "other":      "果小蜜这边出了点小状况，麻烦您再试一次哦～",
+}
+
+
+def classify_error(exc):
+    """把异常归类成 quota / timeout / connection / content / other 五类之一。"""
+    text = f"{type(exc).__name__}: {exc}"
+    for kind, keys in ERROR_KINDS:
+        if any(k in text for k in keys):
+            return kind
+    return "other"
+
+
+def log_request(record):
+    """把一轮请求追加写入 data/logs/requests.jsonl。
+
+    为什么用 JSONL：一行一条、追加写入，崩溃不会毁掉前面的记录，
+    也能直接 grep / jq，不需要额外依赖。
+    为什么整段包 try：遥测是**旁路**，它自己失败绝不能拖垮主流程。
+    """
+    try:
+        os.makedirs(LOGS_DIR, exist_ok=True)
+        with open(os.path.join(LOGS_DIR, "requests.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        st.warning(f"⚠️ 请求记录写入失败：{e}")
 # ————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 
 # 页面配置
@@ -273,30 +322,88 @@ if prompt:
         + "\n\n## 知识库全文\n\n"
         + get_docs_context()
     )
-    response = client.chat.completions.create(
-        model=os.environ.get('LLM_MODEL', 'qwen-plus-2025-07-28'),
-        messages=[
-            {"role": "system", "content": system_content},
-             *recent_messages(st.session_state.messages, MAX_HISTORY)
-        ],
-        stream=True,
-        # deepseek-v4-pro-0813 为混合思考模型（思考默认关闭），可开启深度思考：
-        # 思考过程在 delta.reasoning_content，正文仍在 delta.content
-        # extra_body={"enable_thinking": True},
-    )
+    # 模型身份的唯一来源是 .env 的 LLM_MODEL。
+    # 兜底：未配置时回退到 qwen3.5-plus-2026-02-15，但**必须显式告警** ——
+    # 静默回退会导致「以为在跑 A、其实在跑 B」，指标全部失效。
+    model = os.environ.get('LLM_MODEL')
+    if not model:
+        model = 'qwen3.5-plus-2026-02-15'
+        st.warning(f"⚠️ 未配置 LLM_MODEL，本次回退到 {model}。建议在 .env 中显式指定。")
+    # ---- 护栏 + 遥测（2026-10-13 新增）----------------------------------
+    # 为什么加：这段调用原本是**裸调** —— 额度耗尽 / 网络抖动会把原始异常
+    # 直接抛给用户；而离线评测（tools/eval_run.py）早就有一套失败保护。
+    # 同一件事，离线严丝合缝、线上零防护 —— 这个不对称就是要补的东西。
+    hist = recent_messages(st.session_state.messages, MAX_HISTORY)
+    record = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "session": st.session_state.current_session,
+        "model": model,
+        "turn": len(st.session_state.messages),   # 含本轮提问，即「第几问」
+        "n_history": len(hist),
+        "system_chars": len(system_content),
+        "q": prompt,
+        "ok": True,
+        "error": None,
+    }
+    t0 = time.perf_counter()
+    first_chunk_at = None
+    usage = None
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_content},
+                *hist,
+            ],
+            stream=True,
+            # 思考链默认关闭。qwen3.7-max 这类模型思考默认开，output 是 36 元/百万
+            # （input 12 元/百万的 3 倍），而果小蜜是「角色扮演式水果导购」，
+            # 不需要思维链 —— 实测关掉后 completion token 从 172 降到 20。
+            # 若模型不支持该参数会报 400，此时删掉这一行即可（行为等同默认）。
+            extra_body={"enable_thinking": False},
+            # 让服务端在流末尾多带一个只含用量信息的数据包（usage）。
+            # 这是运行时能拿到 token 数的唯一途径；若模型不支持会报 400，
+            # 删掉这一行即可（行为等同默认），其余记录字段仍然可用。
+            stream_options={"include_usage": True},
+        )
 
-    # 输出
-    with st.chat_message("assistant"):
-        response_message=st.empty()
-        full_response = ""
-        for chunk in response:
-            # 判空：流式响应中部分数据包的 choices 可能为空列表
-            # （例如开启 stream_options.include_usage 后，最后一个数据包只带用量信息）
-            if chunk.choices and chunk.choices[0].delta.content is not None:
-                content=chunk.choices[0].delta.content
-                full_response+=content
-                response_message.write(full_response)
+        # 输出
+        with st.chat_message("assistant"):
+            response_message=st.empty()
+            full_response = ""
+            for chunk in response:
+                # 判空：流式响应中部分数据包的 choices 可能为空列表
+                # （例如开启 stream_options.include_usage 后，最后一个数据包只带用量信息）
+                if chunk.choices and chunk.choices[0].delta.content is not None:
+                    content=chunk.choices[0].delta.content
+                    if first_chunk_at is None:
+                        first_chunk_at = time.perf_counter()   # 首个正文 token 的时刻
+                    full_response+=content
+                    response_message.write(full_response)
+                # 末尾那个只带 usage 的数据包：choices 为空，但 usage 有值
+                if getattr(chunk, "usage", None):
+                    usage = chunk.usage
 
+    except Exception as e:
+        # 出错不把异常抛给用户：换成一句降级话术，并把错误分类落进记录。
+        # （原先这里没有 try —— 额度耗尽时用户看到的就是一屏原始异常。）
+        kind = classify_error(e)
+        full_response = FALLBACK_TEXT[kind]
+        with st.chat_message("assistant"):
+            st.write(full_response)
+        # 界面提示**不含内部原因**（不暴露「额度」等），细节只写进日志
+        st.warning("⚠️ 本轮回复失败，已降级处理（详见 data/logs/requests.jsonl）")
+        record["ok"] = False
+        record["error"] = {"type": type(e).__name__, "kind": kind}
+
+    # ---- 落盘：无论成功还是降级，都记一条 ----
+    t_end = time.perf_counter()
+    record["answer"] = full_response
+    record["ttft_s"] = round(first_chunk_at - t0, 3) if first_chunk_at else None
+    record["total_s"] = round(t_end - t0, 3)
+    record["in_tokens"] = getattr(usage, "prompt_tokens", None) if usage else None
+    record["out_tokens"] = getattr(usage, "completion_tokens", None) if usage else None
+    log_request(record)
 
     # 保存
     st.session_state.messages.append({"role":"assistant","content":full_response})

@@ -67,7 +67,10 @@ print()
 # messages 里「历史展开」用的锚点会随重构变化（Step 3 把裸切片换成了 recent_messages()）。
 # 原脚本写死 '*st.session_state.messages'，重构后直接抛 ValueError —— 属"检查脚本比实现先过期"。
 # 现改为按优先级探测，命中哪个用哪个。
-HISTORY_ANCHORS = ("*recent_messages(", "*st.session_state.messages")
+# 2026-10-13：线上护栏+遥测改造把历史先取成局部变量 hist（为了记 n_history），
+# 于是 create() 里变成 `*hist,` —— 故补一个锚点。**这不是放宽检查**：
+# 仍要求「system 消息出现位置 < 历史锚点位置」，即 system 必须在最前。
+HISTORY_ANCHORS = ("*hist,", "*recent_messages(", "*st.session_state.messages")
 hist_anchor = next((a for a in HISTORY_ANCHORS if a in src), None)
 system_first = (
     hist_anchor is not None
