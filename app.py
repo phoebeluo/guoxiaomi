@@ -157,7 +157,7 @@ if "current_session" not in st.session_state:
 
 # 知识库全文（P0 全量注入基线）
 # 必须用 @st.cache_data：Streamlit 每次用户交互都会把整个脚本重跑一遍，
-# 不加缓存的话，用户每问一个问题就要重读 44 个文件
+# 不加缓存的话，用户每问一个问题就要重读 45 个文件
 @st.cache_data
 def get_docs_context():
     content, count, chars = load_all_docs(DOCS_DIR)
