@@ -12,7 +12,7 @@ import copy
 import os
 import sys
 
-APP = r"E:\guoxiaomi\app.py"
+APP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")
 
 WANT_FUNC = "recent_messages"
 WANT_CONST = "MAX_HISTORY"
@@ -23,6 +23,32 @@ results = []
 def check(name, ok, detail=""):
     results.append((name, ok, detail))
     print(f"  {'[通过]' if ok else '[失败]'} {name}" + (f"   {detail}" if detail else ""))
+
+
+def find_call_sites(src):
+    """用 AST 找「历史被 recent_messages 处理过」的证据。
+
+    为什么不用字符串匹配：2026-10-13 护栏改造把
+        messages=[{"role":"system",...}, *recent_messages(msgs, MAX_HISTORY)]
+    改成了
+        hist = recent_messages(msgs, MAX_HISTORY)
+        messages=[{"system"...}, *hist]
+    于是 `*recent_messages(` 这个字面量消失了 —— **检查脚本比实现先过期**。
+    （同类坑在 check_injection.py 已踩过一次，那次也是改成锚点探测。）
+
+    现在改为看语义，变量怎么改名都不影响：
+      ① 存在对 recent_messages(...) 的**调用**（不是 def 那一处）
+      ② 该调用被展开进 messages（即 messages 列表里有 Starred 元素，
+         或调用结果被赋值给变量后以 Starred 形式出现）
+    """
+    tree = ast.parse(src)
+    calls = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Name) and n.func.id == WANT_FUNC]
+    # messages=[...] 里是否有 *xxx 展开
+    starred = [n for n in ast.walk(tree)
+               if isinstance(n, ast.Starred)]
+    return calls, starred
 
 
 def load_symbols(path):
@@ -78,10 +104,17 @@ def main():
         isinstance(ns.get(WANT_CONST), int) and ns.get(WANT_CONST) > 0,
     )
     check(f"{WANT_FUNC} 已定义且可调用", callable(ns.get(WANT_FUNC)))
+
+    calls, starred = find_call_sites(src)
     check(
-        "调用点已改为 recent_messages",
-        f"*{WANT_FUNC}(" in src.replace(" ", ""),
-        "在 messages=[...] 中应当展开 recent_messages(...)",
+        f"调用点已使用 {WANT_FUNC}(...)",
+        len(calls) >= 1,
+        f"找到 {len(calls)} 处调用（AST 语义判定，不受变量改名影响）",
+    )
+    check(
+        "历史以 * 展开进 messages",
+        len(starred) >= 1,
+        f"找到 {len(starred)} 处星号展开",
     )
 
     fn = ns[WANT_FUNC]

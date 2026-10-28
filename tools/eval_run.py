@@ -70,30 +70,182 @@ SYSTEM_PROMPT = _load_system_prompt()
 
 _DOCS_CACHE = {}
 
+# 额外语料目录（2026-10-28 新增，W4 规模实验用）
+# 为什么不在 data/docs 里加文件：`data/docs/` 是评测基准，一动 45 篇的基线与
+# 历史报告全部作废（eval/README「坑」第一条）。所以外部语料留在 data/raw/，
+# 由这个参数**在运行时**拼进「全量注入」策略 —— 45 篇档不传即为基线，行为完全不变。
+_EXTRA_DIRS = []
+
 
 def _docs_content():
-    """44 篇语料拼成的单一字符串（缓存，避免重复读盘）。"""
+    """全量语料拼成的单一字符串（缓存，避免重复读盘）。"""
     if "content" not in _DOCS_CACHE:
         from rag.load_docs import load_all_docs, DOCS_DIR
         content, count, chars = load_all_docs(DOCS_DIR)
+        for extra in _EXTRA_DIRS:
+            more, n2, ch2 = load_all_docs(extra)
+            content = content + "\n\n" + more
+            count += n2
+            chars += ch2
         _DOCS_CACHE.update(content=content, count=count, chars=chars)
     return _DOCS_CACHE
 
 
-def _sys_none():
+# ----------------------------------------------------------------------
+# A2 注入策略 A/B 用的辅助（2026-10-12）
+# 做法：拿 cases.jsonl 的 source 字段当 **oracle**，模拟「理想检索恰好命中
+#       该题依据的那篇」，与「全量注入」对照 —— 把「要不要上检索」变成数字。
+# ⚠️ 这是 proxy（代理指标），**不是**检索实验：它测的是「注入内容」，
+#    链路上不含任何检索器。引用时不许说成「我做了检索实验」。
+# ----------------------------------------------------------------------
+
+_GOLD_DOC_CACHE = {}   # 文件名 -> 已渲染片段，避免逐题重复读盘
+_NOISE3 = []           # 固定噪声篇目，由 _init_noise(cases) 在 run() 开头填充
+
+
+def _all_doc_names():
+    """data/docs 下的全部 .md 文件名（排序，保证可复现）。"""
+    from rag.load_docs import DOCS_DIR
+    return sorted(f for f in os.listdir(DOCS_DIR) if f.endswith(".md"))
+
+
+def _docs_by_names(names):
+    """按**文件名**读取指定篇目并按 load_docs 的格式拼接。
+
+    为什么必须复用同一格式（每篇以「【来源：标题】」开头、篇间空行分隔）：
+    A/B 对照要求两组 system 除「注入哪几篇」外完全一致 ——
+    格式差一点，落差就无法归因到「注入内容」上。
+
+    2026-10-28 改：支持 `--extra-dir`。原先只查 `data/docs`，一旦开了扩展语料，
+    BM25 检索到的外部篇目就取不到正文（KeyError）。查找顺序 = 主语料优先，
+    与 `_docs_content()` 的拼接顺序保持一致。
+    """
+    from rag.load_docs import DOCS_DIR
+    search_dirs = [DOCS_DIR] + list(_EXTRA_DIRS)
+    parts = []
+    for name in names:
+        if name not in _GOLD_DOC_CACHE:
+            for d in search_dirs:
+                path = os.path.join(d, name)
+                if os.path.exists(path):
+                    with open(path, encoding="utf-8") as f:
+                        _GOLD_DOC_CACHE[name] = f"【来源：{name[:-3]}】\n{f.read()}"
+                    break
+            else:
+                raise FileNotFoundError(f"找不到篇目：{name}（已查 {search_dirs}）")
+        parts.append(_GOLD_DOC_CACHE[name])
+    return "\n\n".join(parts)
+
+
+def _init_noise(cases):
+    """选定 3 篇「不被任何题 source 引用」的文档作固定噪声。
+
+    为什么必须「未被任何题引用」：噪声只负责模拟 top-k 里的无关命中、
+    顺便把 token 撑到真实检索的量级。若顺手带入别题答案，
+    gold 就从「理想检索」变成「超额注入」，对照失效。
+    """
+    global _NOISE3
+    used = set()
+    for c in cases:
+        # 2026-10-15：金标篇目也纳入「已占用」——否则噪声篇可能正好命中别题答案，
+        # 让 oracle 从「理想检索」变成「超额注入」，对照失效。
+        used.update(c.get("gold_sources") or [])
+        used.update(re.findall(r"[\w\u4e00-\u9fa5-]+\.md", c.get("source", "")))
+    _NOISE3 = [n for n in _all_doc_names() if n not in used][:3]
+    return _NOISE3
+
+
+def _gold_names(case):
+    """理想检索的「命中结果」：该题金标篇目 + 固定噪声（总篇数至少 3）。
+
+    2026-10-15 改：**优先使用 `gold_sources` 列表**（支持多答案题注入多篇），
+    无该字段时回退到旧的「从 `source` 描述里正则抽 1 篇」逻辑 —— 兼容旧题库格式。
+    `rule` / `boundary` 类题 `gold_sources` 为空 → 全部由噪声补足 3 篇，
+    使每题注入篇数下限恒为 3，token 量稳定、可比。
+    """
+    valid = set(_all_doc_names())
+    if "gold_sources" in case:
+        gold = case.get("gold_sources") or []
+    else:
+        gold = re.findall(r"[\w\u4e00-\u9fa5-]+\.md", case.get("source", ""))
+    picked = [n for n in dict.fromkeys(gold) if n in valid]
+    for n in _NOISE3:
+        if len(picked) >= 3:
+            break
+        if n not in picked:
+            picked.append(n)
+    return picked
+
+
+def _sys_none(case=None):
     """策略 A：只给 system_prompt，不含任何语料。"""
     return SYSTEM_PROMPT
 
 
-def _sys_inject():
+def _sys_inject(case=None):
     """策略 B：全量注入（P0 方案）。"""
     return SYSTEM_PROMPT + "\n\n## 知识库全文\n\n" + _docs_content()["content"]
 
 
-# 新增策略只改这里。格式：key -> (显示名, 构造函数的零参可调用对象)
+def _sys_inject_gold(case=None):
+    """策略 C：理想检索（oracle）—— 只注入该题依据的那 1 篇 + 2 篇噪声。
+
+    ⚠️ 它假设检索**永远命中正确文档**，是真实检索的**上界**（真实检索做不到）。
+    故：连上界都掉分 → 真实检索必然更差；上界持平 → 检索至少不损失效果。
+    """
+    names = _gold_names(case) if case else list(_NOISE3)
+    return SYSTEM_PROMPT + "\n\n## 知识库全文\n\n" + _docs_by_names(names)
+
+
+_BM25_CACHE = {}
+
+
+def _bm25_index():
+    """语料 BM25 索引（按「主语料 + 扩展目录」组合缓存）。纯本地计算，零 API。"""
+    key = tuple(_EXTRA_DIRS)
+    if key not in _BM25_CACHE:
+        import glob
+        from rag.bm25 import BM25
+        from rag.load_docs import DOCS_DIR
+        docs = []
+        for d in [DOCS_DIR] + list(_EXTRA_DIRS):
+            for p in sorted(glob.glob(os.path.join(d, "*.md"))):
+                with open(p, encoding="utf-8") as f:
+                    docs.append((os.path.basename(p), f.read()))
+        _BM25_CACHE[key] = BM25(docs)
+    return _BM25_CACHE[key]
+
+
+def _sys_bm25(case=None):
+    """策略 D：**真实检索** —— BM25 取 top-3 篇注入（线上真实路径）。
+
+    与 C（理想检索）的差别只有一个：**注入哪 3 篇由检索器决定，不再由金标决定**。
+    两者格式完全一致、篇数恒为 3，故 `C − D` 的差值可干净归因到「检索器」。
+    这是本项目第一条真正归因到检索的数字，而检索本身是本地计算、**零 API**。
+
+    为什么补齐到 3 篇：C 策略恒注入 3 篇，若 D 只检索到 2 篇，system 长度差
+    会变成混杂变量（少一篇也可能少一段答案）。补齐后两策略篇数对齐。
+    """
+    if not case:
+        return SYSTEM_PROMPT + "\n\n## 知识库全文\n\n" + _docs_by_names(list(_NOISE3))
+    q = case["q"]
+    if case.get("history"):
+        q = " ".join(case["history"]) + " " + q
+    hits = [d for d, _ in _bm25_index().search(q, top_k=3)]
+    for n in _NOISE3:
+        if len(hits) >= 3:
+            break
+        if n not in hits:
+            hits.append(n)
+    return SYSTEM_PROMPT + "\n\n## 知识库全文\n\n" + _docs_by_names(hits)
+
+
+# 新增策略只改这里。格式：key -> (显示名, 构造函数：接收当前题 case，可忽略)
 STRATEGIES = {
-    "none":   ("A·无语料",   _sys_none),
-    "inject": ("B·全量注入", _sys_inject),
+    "none":        ("A·无语料",        _sys_none),
+    "inject":      ("B·全量注入",      _sys_inject),
+    "inject-gold": ("C·理想检索(3篇)", _sys_inject_gold),
+    "bm25":        ("D·BM25检索(3篇)", _sys_bm25),
 }
 
 
@@ -140,6 +292,30 @@ def check_cases(cases):
                 re.compile(c["pattern"])
             except re.error as e:
                 errors.append(f"{tag} 正则无法编译：{e}")
+
+        # gold_sources（2026-10-15 新增）：金标篇目列表
+        #   规则（见 docs/金标规则说明-20261015.md）：
+        #   · 必须存在、必须是列表；
+        #   · 元素必须是 data/docs 下真实存在的 .md 文件名（不写路径）；
+        #   · 与 expect 自洽：has 必须非空；none / constraint 必须为空。
+        if "gold_sources" not in c:
+            errors.append(f"{tag} 缺字段 gold_sources")
+        else:
+            gs = c["gold_sources"]
+            if not isinstance(gs, list):
+                errors.append(f"{tag} gold_sources 不是列表：{gs!r}")
+            else:
+                valid_docs = set(_all_doc_names())
+                for n in gs:
+                    if not isinstance(n, str):
+                        errors.append(f"{tag} gold_sources 元素不是字符串：{n!r}")
+                    elif n not in valid_docs:
+                        errors.append(f"{tag} gold_sources 指向不存在的文档：{n}")
+                if c.get("expect") == "has" and not gs:
+                    errors.append(f"{tag} expect=has 但 gold_sources 为空")
+                if c.get("expect") in ("none", "constraint") and gs:
+                    errors.append(
+                        f"{tag} expect={c.get('expect')} 却带了 gold_sources：{gs}")
     return errors
 
 # 计数
@@ -153,6 +329,15 @@ def print_coverage(cases):
     print(f"  题目总数：{len(cases)}")
     print("  按类别：" + "  ".join(f"{k}×{v}" for k, v in sorted(by_cat.items())))
     print("  按类型：" + "  ".join(f"{k}×{v}" for k, v in sorted(by_kind.items())))
+    # 金标分布（2026-10-15 新增）：口径见 docs/金标规则说明-20261015.md
+    n_single = sum(1 for c in cases if len(c.get("gold_sources") or []) == 1)
+    n_multi = sum(1 for c in cases if len(c.get("gold_sources") or []) >= 2)
+    n_none = sum(1 for c in cases if not c.get("gold_sources"))
+    print(f"  金标：可回答(1篇)×{n_single}  多答案(≥2篇)×{n_multi}  库外(0篇)×{n_none}")
+    # 留出集（2026-10-19 划入）：只用于最终汇报，调参期间须用 --no-holdout 排除。
+    n_hold = sum(1 for c in cases if c.get("holdout"))
+    if n_hold:
+        print(f"  留出集：{n_hold} 题（默认计入全集；调参请加 --no-holdout）")
 
 
 # ======================================================================
@@ -170,7 +355,25 @@ def print_coverage(cases):
 # 中间插了宾语导致不连续匹配失败。现改为收录「不能」这一前缀词根，
 # 覆盖 不能说 / 不能保证 / 不能跟您说 / 不能打包票 等全部变体。
 NEGATION = re.compile(r"(不敢|不能|没法|无法|没有|不存在|不会|不跟您说|"
-                      r"不承诺|不许说|不夸|杜绝|避免)")
+                      r"不承诺|不许说|不夸)")
+# 实证 #38：「为了避免物流信息混乱，**同一订单最多支持修改 2 次**」
+# —— 「避免」在讲规定的原因，却被当成对「2 次」的否认，命中被整条剔除。
+# 这两词在真实语料里更多出现在「为了避免踩坑，建议…」这类正向句，保留只会制造假阴性。
+
+# 命中词之前、**同一句内**的上下文（不跨句末标点/换行）。
+# 2026-10-19 修正：原实现固定回看 15 字符，两个方向都踩坑 ——
+#   · 窗口太短（漏判）：#5「没有任何人敢拍着胸脯保证“100% 绝对新鲜”」，
+#     否定词「没有」距命中 20 字外，被当成「使用」→ 守住约束的回答被判违规。
+#   · 跨句污染（误杀）：#48「…**绝对不会！**\n\n我们的客服**绝不会**索要…」，
+#     回看 15 字跨到上一句的「不会」，把正确答案自己剔掉。
+# 改用句子边界：语义上「否定」的辖域本来就止于句末，比固定字数可靠。
+_SENT_END = "。！？!?\n"
+
+
+def _ctx_in_sentence(text, pos):
+    """取 text[pos] 所在句子中、pos 之前的部分。"""
+    start = max(text.rfind(ch, 0, pos) for ch in _SENT_END) + 1
+    return text[start:pos]
 
 # 判断模型答案是否通过
 def judge(answer, case):
@@ -182,8 +385,7 @@ def judge(answer, case):
     hits = []
     if case.get("pattern"):
         for m in re.finditer(case["pattern"], answer):
-            ctx = answer[max(0, m.start() - 15):m.start()]   # 只看紧邻的前文
-            if NEGATION.search(ctx):
+            if NEGATION.search(_ctx_in_sentence(answer, m.start())):
                 continue
             hits.append(m.group(0))
     refusals = [m for m in HARD_REFUSAL if m in answer]
@@ -196,10 +398,16 @@ def judge(answer, case):
     return ok, hits, refusals
 
 def _ask(client, model, messages):
+    # max_tokens 兜底，防止模型自由发挥把输出 token 拉高（output 是 36 元/百万，
+    # 比 input 12 元/百万 贵 3 倍，是主要成本项）。
+    # enable_thinking=False：果小蜜的判分只看「有没有命中关键词 / 有没有拒答」，
+    # 不需要思维链。实测关掉后 reasoning token 从 146 → 0，输出 token 从 172 → 14。
     resp = client.chat.completions.create(
         model=model,
         messages=messages,
         temperature=0,
+        max_tokens=1024,
+        extra_body={"enable_thinking": False},
     )
     return resp.choices[0].message.content
 
@@ -219,9 +427,12 @@ def write_report(cases, modes, results, system_lengths, failures, model, out_pat
     """
     # ---------- 汇总 ----------
     # turn:None单轮+多轮全收  single单轮题 multi多轮题
+    # counted:False 的题（对照组，如普适常识题）一律不计入分母 —— 它们
+    #   答对与否不能归功于知识库接入，混进来会虚高通过率、掩盖真实差距。
     def rate(mode, kinds=None, turns=None):
         rows = [r for c in cases
                 if (kinds is None or c["expect"] in kinds)
+                and c.get("counted", True)
                 and (turns is None
                      or (turns == "single" and "history" not in c)
                      or (turns == "multi" and "history" in c))
@@ -231,6 +442,25 @@ def write_report(cases, modes, results, system_lengths, failures, model, out_pat
         return sum(1 for r in rows if r["ok"]) / len(rows)
 
     invalid = bool(failures)
+
+    # ---------- 可疑样本：极短回答（2026-10-13 新增）----------
+    # 为什么需要：A2 实测撞到一次 —— inject 侧 #19 的存档回答只有 10 个字符
+    # （『哈喽呀!" />』），明显是被截断或写坏的响应。它**不抛异常**（所以不被
+    # failures 捕获），judge 却把它判成「未通过」→ **冒充成模型失败**，
+    # 差点让整轮 A/B 得出错误结论（单独重跑 3 次，全部正常通过）。
+    # 阈值取 12 字符：本项目合法回答都是整段话术，最短的也在 300 字以上。
+    # ⚠️ 它只**告警**、不改判定 —— 极短回答也可能是一条合法的简短拒答，
+    #    所以它进的是「可疑清单」而不是 failures（后者会把整份报告标为无效）。
+    suspects = []
+    for m in modes:
+        for c in cases:
+            r = results[m].get(c["id"])
+            if not r:
+                continue
+            ans = (r.get("answer") or "").strip()
+            if len(ans) < 12:
+                suspects.append((m, c["id"], ans))
+
     lines = []
     lines.append("# 评测结果\n")
     if invalid:
@@ -243,9 +473,19 @@ def write_report(cases, modes, results, system_lengths, failures, model, out_pat
                      "网络不可达。下方所有 `未通过` 均可能是调用失败而非模型答错。\n")
     if note:
         lines.append(f"> 🔁 {note}\n")
+    if suspects:
+        lines.append(f"> ⚠️ **可疑样本 {len(suspects)} 个**（回答不足 12 字符，疑为被截断或写坏的响应）："
+                     + "、".join(f"{m}#{cid}" for m, cid, _ in suspects)
+                     + "。其「未通过」**不可当作模型失败**，须单独重跑确认。\n")
     lines.append(f"- 时间：{datetime.now():%Y-%m-%d %H:%M:%S}")
     lines.append(f"- 模型：`{model}`")
     lines.append(f"- 题目数：{len(cases)}")
+    n_control = sum(1 for c in cases if not c.get("counted", True))
+    if n_control:
+        # 分母口径必须写进报告 —— 否则读报告的人无法判断 "94%" 是几分之几，
+        # 也无法和旧报告对比（旧报告分母含对照组）。
+        lines.append(f"- 计入通过率：**{len(cases) - n_control} 题**"
+                     f"（另 {n_control} 题对照组不计入，见下方说明）")
     lines.append(f"- 语料：{_docs_content()['count']} 篇 / "
                  f"{_docs_content()['chars']} 字\n")
 
@@ -256,7 +496,11 @@ def write_report(cases, modes, results, system_lengths, failures, model, out_pat
 
     for mode in modes:
         name, _ = STRATEGIES[mode]
-        has_cases = [c for c in cases if c["expect"] == "has"]
+        # 与「事实题」列**同口径**：单轮 + 计入分母。
+        # 否则分子分母会打架（原来分母把多轮 has 题也算进来，和那列的题数对不上）。
+        has_cases = [c for c in cases
+                     if c["expect"] == "has" and "history" not in c
+                     and c.get("counted", True)]
         refusals = sum(1 for c in has_cases if results[mode][c["id"]]["refusals"])
         def pct(v):
             return "—" if v is None else f"{v:.0%}"
@@ -269,6 +513,18 @@ def write_report(cases, modes, results, system_lengths, failures, model, out_pat
     lines.append("")
     lines.append("> **事实题拒答次数**是 P0 的关键指标：知识库接上之前，"
                  "它等于题目数（全拒答）。\n")
+
+    # ---------- 对照组题（counted:false）单独列出 ----------
+    # 为什么要单列：这类题（如「榴莲热量」）是模型自带常识，无语料也能答对。
+    # 若混进分母，会让「事实题通过率」虚高，掩盖知识库接入的真实贡献。
+    # 它们不是废题——它们是**校准项**：告诉你 A/B 差值里有多少是模型本来就有的。
+    control = [c for c in cases if not c.get("counted", True)]
+    if control:
+        lines.append("> **对照组题（不计入任何通过率）**：" +
+                     "、".join(f"#{c['id']}『{c['q']}』" for c in control) +
+                     "。\n> 理由：答案属模型自带常识，无语料策略也会答对，"
+                     "因此**不能用来证明知识库接入的收益**，"
+                     "故排除在分母外、单独列出作为 A/B 差值的校准参考。\n")
 
     # ---------- 逐题明细 ----------
     lines.append("## 逐题明细\n")
@@ -297,9 +553,13 @@ def write_report(cases, modes, results, system_lengths, failures, model, out_pat
             "model": model,
             "n_cases": len(cases),
             "n_docs": _docs_content()["count"],
+            # 对照组题：不计入通过率（模型自带常识，无法证明知识库贡献）
+            "control_cases": [c["id"] for c in cases if not c.get("counted", True)],
             "valid": not invalid,
             "n_failures": len(failures),
             "failures": [{"mode": m, "case_id": cid, "error": et} for m, cid, et in failures],
+            # 可疑样本：极短回答（疑被截断）—— 与 failures 分开，不使报告失效
+            "suspects": [{"mode": m, "case_id": cid, "answer": a} for m, cid, a in suspects],
             "system_lengths": system_lengths,
             "rates": {m: {**{k: rate(m, (k,), "single") for k in VALID_EXPECT},
               "multi": rate(m, None, "multi")} for m in modes},
@@ -317,6 +577,12 @@ def write_report(cases, modes, results, system_lengths, failures, model, out_pat
     for mode in modes:
         name, _ = STRATEGIES[mode]
         print(f"  {name:<12} 总通过率 {rate(mode):.0%}")
+    if suspects:
+        print(f"\n  ⚠️ 可疑样本 {len(suspects)} 个（回答 < 12 字符，疑被截断/写坏）："
+              + "、".join(f"{m}#{cid}" for m, cid, _ in suspects))
+        for m, cid, a in suspects:
+            print(f"     {m}#{cid} 原文={a!r}")
+        print("     其「未通过」不可当模型失败 —— 请单独重跑该题确认。")
     print(f"\n报告已写入：{out_path}")
     print(f"结构化数据：{json_path}")
 
@@ -331,7 +597,15 @@ def run(cases, modes, out_path):
     from openai import OpenAI
 
     load_dotenv(os.path.join(PROJECT, ".env"))
-    model = os.environ.get("LLM_MODEL", "deepseek-v4-pro-0813")
+    # 模型身份的唯一来源是 .env 的 LLM_MODEL。
+    # 兜底：未配置时回退到 qwen3.7-plus，但**必须显式告警** ——
+    # 静默回退会跑出「看起来正常、其实用错模型」的报告（指标管道骗人）。
+    # 2026-10-26 改：原兜底 qwen3.5-plus-2026-02-15 已 403 下线，回退到它等于必然失败。
+    model = os.environ.get("LLM_MODEL")
+    if not model:
+        model = "qwen3.7-plus"
+        print(f"⚠️ 未设置 LLM_MODEL，回退到 {model}"
+              f"（报告将以该模型名落档；建议在 .env 中显式指定）")
     client = OpenAI(
         api_key=os.environ.get("DASHSCOPE_API_KEY"),
         base_url=os.environ.get("DASHSCOPE_BASE_URL",
@@ -342,15 +616,21 @@ def run(cases, modes, out_path):
     results = {m: {} for m in modes}
     system_lengths = {}
     failures = []          # [(策略, 题号, 异常类型)] —— 用于识别「额度耗尽」这类假失败
+    _init_noise(cases)      # gold 策略的固定噪声篇目（依赖题目集）
+
     for mode in modes:
         name, builder = STRATEGIES[mode]
-        system_content = builder()
-        system_lengths[mode] = len(system_content)
-        print(f"\n{'=' * 66}\n策略 {mode}（{name}）system 长度 {len(system_content)} 字符"
-              f"\n{'=' * 66}")
+        # gold 策略逐题不同 → 该列取「逐题长度均值」作代表值；
+        # 其余策略每题相同，均值即常量，不受影响。
+        lens = [len(builder(c)) for c in cases]
+        system_lengths[mode] = sum(lens) // len(lens)
+        varied = "（逐题不同，此为均值）" if len(set(lens)) > 1 else ""
+        print(f"\n{'=' * 66}\n策略 {mode}（{name}）system 长度 "
+              f"{system_lengths[mode]:,} 字符{varied}\n{'=' * 66}")
 
         for case in cases:
             try:
+                system_content = builder(case)
                 msgs = [{"role": "system", "content": system_content}]
                 for t in case.get("history", []):
                     msgs.append({"role": "user", "content": t})
@@ -455,12 +735,31 @@ def main():
     ap.add_argument("--rejudge", metavar="JSON", nargs="?", const=default_json,
                     help=f"从已有报告 json 离线重判，不调用 API"
                          f"（不带路径时默认 {default_json}）")
+    ap.add_argument("--no-holdout", action="store_true",
+                    help="排除留出集题目（W3–W8 调参期间用；最终汇报才跑全集）")
+    ap.add_argument("--extra-dir", action="append", default=[], metavar="DIR",
+                    help="额外语料目录（可重复）。只影响「全量注入」策略；不传 = 45 篇基线")
+    ap.add_argument("--limit", type=int, default=0, metavar="N",
+                    help="只跑前 N 题（额度探底用）。0 = 不限")
     args = ap.parse_args()
 
     print(f"题目文件：{CASES_PATH}")
+    if args.extra_dir:
+        # 必须在任何 _docs_content() 调用之前设置，否则缓存里是旧内容
+        _EXTRA_DIRS.extend(args.extra_dir)
+        _DOCS_CACHE.clear()
+        print(f"⚠️ --extra-dir：全量注入将额外并入 {len(args.extra_dir)} 个目录 —— "
+              f"这与 45 篇基线**不可直接比较**，报告里必须写明语料规模")
     cases = load_cases()
     if not cases:
         raise SystemExit("cases.jsonl 是空的 —— 先写题。")
+
+    # 留出集隔离：调参期间不看这 8 题，避免「用考题调参」导致的乐观偏差。
+    if args.no_holdout:
+        held = sorted(c["id"] for c in cases if c.get("holdout"))
+        cases = [c for c in cases if not c.get("holdout")]
+        print(f"⚠️ --no-holdout：已排除留出集 {len(held)} 题 {held}"
+              f"，本次只跑 {len(cases)} 题")
 
     errors = check_cases(cases)
     print_coverage(cases)
@@ -470,6 +769,16 @@ def main():
             print(f"  ✗ {e}")
         raise SystemExit(1)
     print("  字段与正则校验：通过")
+
+    # 额度探底：先跑 N 题确认链路与免费额度，再决定要不要跑全量。
+    # 动机是「免费额度模式下 403 只会出现在中途」——52 题跑到第 30 题断掉，
+    # 会留下半份报告并被改名 *_INVALID，白烧前面 29 题的额度。
+    # 故探底必须在开始前显式收缩题量，而不是边跑边撞。
+    if args.limit:
+        before = len(cases)
+        cases = cases[:args.limit]
+        print(f"⚠️ --limit：只跑前 {len(cases)} 题（共 {before} 题），用于额度探底 —— "
+              f"**这份报告不能当验收数字**")
 
     if args.check:
         print("\n（--check 模式，未调用 API）")
