@@ -8,3 +8,17 @@ data/logs/
 .venv/
 .pytest_cache/
 
+# 工具与 agent 的本地目录，不入库
+.workbuddy/
+.ruff_cache/
+
+# 参考区：对答案用的完整实现，纳入版本库会污染「独立完成」的证据链
+_reference_20260928/
+
+# 抓取中间产物：只保留清洗后语料（*_clean / fruit_noise），原始 HTML 与日志不入库
+data/raw/corpus/
+data/raw/corpus2/
+data/raw/external/
+data/raw/_probe/
+data/raw/sample/
+data/raw/*.log
