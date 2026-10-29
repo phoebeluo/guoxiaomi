@@ -6,6 +6,7 @@ import os
 import json
 import time
 from rag.load_docs import load_all_docs, DOCS_DIR
+from rag.bm25 import BM25
 
 load_dotenv()
 
@@ -155,13 +156,71 @@ if "character" not in st.session_state:
 if "current_session" not in st.session_state:
     st.session_state.current_session = generate_session_name()
 
-# 知识库全文（P0 全量注入基线）
-# 必须用 @st.cache_data：Streamlit 每次用户交互都会把整个脚本重跑一遍，
-# 不加缓存的话，用户每问一个问题就要重读 45 个文件
+# 知识库注入方式（W5 · 2026-10-29）
+# RETRIEVAL=on  → BM25 取 top-3 篇注入（线上真实路径，与 W4「D·BM25检索」同口径）
+# RETRIEVAL=off → 全量注入 45 篇（W1–W4 基线口径，保留作 A/B 对照组）
+#
+# 为什么把开关做成环境变量而不是界面控件：界面控件会让用户在会话中途切换注入方式，
+# 同一段对话前后的 system 口径就变了，回答变化无法归因。环境变量是「启动即定」。
+_RETRIEVAL = os.environ.get("RETRIEVAL", "on").strip().lower() != "off"
+TOPK = 3
+
+# 外部语料**默认不进线上索引**（2026-10-29 实测决定）：
+#   加上 301 篇后，命中一篇法规长文就能把 system 从 5.6K 撑到 18.7K 字符，
+#   且口语提问（如「这单能赔多少」）会被「如何处理」之类的虚词拉去命中《能力验证不合格怎么办》
+#   这类完全无关的检定文书 —— 异构噪声在 R@5 指标上不衰减，但在**实际注入内容**上明显跑偏。
+#   故线上只用冻结的 45 篇；301 篇的价值在评测侧（证明规模不衰减），不在线上。
+#   需要复现 346 档线上路径时：RETRIEVAL_EXTRA=data/raw/external_clean
+_extra = os.environ.get("RETRIEVAL_EXTRA", "").strip()
+EXTRA_DIRS = [os.path.join(os.path.dirname(os.path.abspath(__file__)), _extra)] if _extra else []
+
+
+@st.cache_resource
+def get_bm25_index():
+    """全文 BM25 索引。
+
+    用 @st.cache_resource 而不是 @st.cache_data：cache_data 会把返回对象**序列化拷贝**，
+    每次交互都付一次深拷贝（本索引含全部倒排表）；cache_resource 只保存引用，跨会话共享同一对象。
+    """
+    import glob
+    docs = []
+    for d in [DOCS_DIR] + EXTRA_DIRS:
+        for p in sorted(glob.glob(os.path.join(d, "*.md"))):
+            with open(p, encoding="utf-8") as f:
+                docs.append((os.path.basename(p), f.read()))
+    return BM25(docs)
+
+
 @st.cache_data
 def get_docs_context():
+    """全量注入（RETRIEVAL=off 时使用，也是 A/B 的对照组）。
+
+    必须缓存：Streamlit 每次交互都重跑整个脚本，不缓存则每问一句重读 45 个文件。
+    """
     content, count, chars = load_all_docs(DOCS_DIR)
     return content
+
+
+def retrieve(query, k=TOPK):
+    """返回 [(篇名, 正文)]，按 BM25 分数降序。
+
+    检索的是**整篇**而不是块，与 eval_run `_sys_bm25` 逐字同口径 ——
+    线上和评测必须用同一个检索单元，否则 98% 那个数字无法支撑线上行为。
+    """
+    idx = get_bm25_index()
+    return [(n, idx.text(n)) for n, _ in idx.search(query, top_k=k)]
+
+
+def build_knowledge_block(query):
+    """拼「知识库全文」段。返回 (文本, 来源篇名列表)。"""
+    if not _RETRIEVAL:
+        return get_docs_context(), []
+    hits = retrieve(query)
+    if not hits:
+        # 零命中不静默退回全量（那等于把 30K 字符又塞回去，等于没做检索），
+        # 而是给空块，让模型走「不知道就明说」的三步回复。
+        return "（本次检索未命中任何文档，请按能力边界如实告知没有这项信息）", []
+    return "\n\n".join(f"### {n}\n{t}" for n, t in hits), [n for n, _ in hits]
 
 
 # 系统提示词
@@ -244,7 +303,8 @@ system_prompt="""
 - **不越权承诺**: 不得承诺未经确认的金额与时效，如"今天肯定能到""明天一定给您补发""老板特批给您免单"。涉及金额与时效的承诺一律以公开政策为准，不可自行加码。
 - **健康类必须加免责**: 涉及孕妇、婴幼儿、慢性病患者、正在服药人群的食用建议，必须附上"这部分建议您咨询专业医生，果小蜜只能提供水果本身的常识哦～"。
 - **不贬低竞品**: 只强调自身产品的优势，不主动攻击其他商家或水果品种。
-- **保持人设**: 始终记住自己是"果小蜜"，不要跳出角色回答与水果销售无关的问题。涉及天气、订单、物流状态等实时信息时，如实告知你无法实时查询，不得用话术回避，也不得说“帮您查一下”“稍后告诉您”这类话。"""
+- **保持人设**: 始终记住自己是"果小蜜"，不要跳出角色回答与水果销售无关的问题。涉及天气、订单、物流状态等实时信息时，如实告知你无法实时查询，不得用话术回避，也不得说“帮您查一下”“稍后告诉您”这类话。
+- **必须标出处**: 凡依据下方知识库作答的内容，须在对应结论后括注篇名，格式 `【来源：篇名】`，多篇并列如 `【来源：A、B】`。**凡知识库中没有依据的内容，一律不得标注来源**，按「不知道就明说」处理。出处是给顾客核对依据用的，编造篇名比不给来源更糟。"""
 
 # 标题
 st.title("果小蜜")
@@ -315,12 +375,13 @@ if prompt:
     # 一旦语料中出现 JSON 示例或模板语法就会抛 KeyError。
     # replace 只精确替换这两个字符串，语料内容不会被误伤。
     # 语料拼在系统提示词之后、位于 messages 最前，保证前缀固定可命中 cache
+    knowledge, sources = build_knowledge_block(prompt)
     system_content = (
         system_prompt
         .replace("{name}", st.session_state.nickname)
         .replace("{character}", st.session_state.character)
         + "\n\n## 知识库全文\n\n"
-        + get_docs_context()
+        + knowledge
     )
     # 模型身份的唯一来源是 .env 的 LLM_MODEL。
     # 兜底：未配置时回退到 qwen3.5-plus-2026-02-15，但**必须显式告警** ——
@@ -342,6 +403,7 @@ if prompt:
         "n_history": len(hist),
         "system_chars": len(system_content),
         "q": prompt,
+        "sources": sources,          # 本次注入的篇名，用于事后核对「回答依据 vs 实际注入」
         "ok": True,
         "error": None,
     }
@@ -407,5 +469,9 @@ if prompt:
 
     # 保存
     st.session_state.messages.append({"role":"assistant","content":full_response})
+
+    # 出处展示：放在回答之后，用 caption 弱化视觉权重（不是正文，是依据）
+    if sources:
+        st.caption("📚 本轮依据：" + " · ".join(s[:-3] if s.endswith(".md") else s for s in sources))
 
     save_messages()
