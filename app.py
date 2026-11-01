@@ -7,6 +7,7 @@ import json
 import time
 from rag.load_docs import load_all_docs, DOCS_DIR
 from rag.bm25 import BM25
+from rag.vector import VectorIndex
 
 load_dotenv()
 
@@ -162,7 +163,20 @@ if "current_session" not in st.session_state:
 #
 # 为什么把开关做成环境变量而不是界面控件：界面控件会让用户在会话中途切换注入方式，
 # 同一段对话前后的 system 口径就变了，回答变化无法归因。环境变量是「启动即定」。
-_RETRIEVAL = os.environ.get("RETRIEVAL", "on").strip().lower() != "off"
+# RETRIEVAL=vector（默认）→ 语义近似 top-3 篇（SVD 低秩，45 篇档实测最优）
+# RETRIEVAL=bm25          → BM25 top-3 篇（W5 上线版，保留可回退）
+# RETRIEVAL=off           → 全量注入 45 篇（W1–W4 基线，A/B 对照组）
+#
+# 为什么默认从 bm25 改成 vector（2026-11-01 实测）：
+#   线上只有 45 篇，同一批 48 题的 R@3：vector 95.8% > RRF 93.8% > bm25 89.6%。
+#   这与 346 篇档的结论相反（那里 RRF 最好）—— 因为降维维度受文档数限制：
+#   45 篇只能降到 45 维（几乎无损），此时语义近似单路最强，融合反而被较弱的 BM25 拖累。
+#   **在 346 篇上调出来的结论不能搬到 45 篇用。**
+_MODE = os.environ.get("RETRIEVAL", "vector").strip().lower()
+if _MODE in ("", "on", "1", "true", "yes"):
+    _MODE = "vector"                     # 兼容 W5 时期的 RETRIEVAL=on
+if _MODE not in ("vector", "bm25", "off"):
+    _MODE = "vector"
 TOPK = 3
 
 # 外部语料**默认不进线上索引**（2026-10-29 实测决定）：
@@ -175,20 +189,36 @@ _extra = os.environ.get("RETRIEVAL_EXTRA", "").strip()
 EXTRA_DIRS = [os.path.join(os.path.dirname(os.path.abspath(__file__)), _extra)] if _extra else []
 
 
-@st.cache_resource
-def get_bm25_index():
-    """全文 BM25 索引。
-
-    用 @st.cache_resource 而不是 @st.cache_data：cache_data 会把返回对象**序列化拷贝**，
-    每次交互都付一次深拷贝（本索引含全部倒排表）；cache_resource 只保存引用，跨会话共享同一对象。
-    """
+def _load_index_docs():
+    """索引语料 = 冻结的 45 篇（+ 可选外部目录）。两种索引共用同一份读入逻辑。"""
     import glob
     docs = []
     for d in [DOCS_DIR] + EXTRA_DIRS:
         for p in sorted(glob.glob(os.path.join(d, "*.md"))):
             with open(p, encoding="utf-8") as f:
                 docs.append((os.path.basename(p), f.read()))
-    return BM25(docs)
+    return docs
+
+
+@st.cache_resource
+def get_bm25_index():
+    """BM25 索引（RETRIEVAL=bm25 时使用）。
+
+    用 @st.cache_resource 而不是 @st.cache_data：cache_data 会把返回对象**序列化拷贝**，
+    每次交互都付一次深拷贝（本索引含全部倒排表）；cache_resource 只保存引用，跨会话共享同一对象。
+    """
+    return BM25(_load_index_docs())
+
+
+@st.cache_resource
+def get_vector_index():
+    """语义近似索引（默认路径）。45 篇构建约 0.02 s，可忽略。
+
+    dim 走默认 128，但会被文档数截断：45 篇 → 45 维。
+    **这正是它在 45 篇档表现最好的原因** —— 没有真正压缩，信息几乎无损；
+    换到 346 篇档才降成 128 维，此时才需要和 BM25 融合互补。
+    """
+    return VectorIndex(_load_index_docs())
 
 
 @st.cache_data
@@ -202,18 +232,20 @@ def get_docs_context():
 
 
 def retrieve(query, k=TOPK):
-    """返回 [(篇名, 正文)]，按 BM25 分数降序。
+    """返回 [(篇名, 正文)]。
 
-    检索的是**整篇**而不是块，与 eval_run `_sys_bm25` 逐字同口径 ——
-    线上和评测必须用同一个检索单元，否则 98% 那个数字无法支撑线上行为。
+    检索的是**整篇**而不是块，与评测脚本逐字同口径 ——
+    线上和评测必须用同一个检索单元，否则那些百分比无法支撑线上行为。
+
+    BM25 与 VectorIndex 的 search/text 签名一致，所以两条路可以在这里直接互换。
     """
-    idx = get_bm25_index()
+    idx = get_vector_index() if _MODE == "vector" else get_bm25_index()
     return [(n, idx.text(n)) for n, _ in idx.search(query, top_k=k)]
 
 
 def build_knowledge_block(query):
     """拼「知识库全文」段。返回 (文本, 来源篇名列表)。"""
-    if not _RETRIEVAL:
+    if _MODE == "off":
         return get_docs_context(), []
     hits = retrieve(query)
     if not hits:
