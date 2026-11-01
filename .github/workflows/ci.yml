@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: 单元测试 + 检查回归
+        # 34 项：检索层契约（分词/IDF/余弦/零命中）+ 12 个校验脚本 + 编译 + 语料指纹
+        run: pytest
+
+      - name: 一键零成本体检
+        # 与 pytest 有重叠，但保留它作为「不看测试框架也能跑」的入口
+        run: python tools/run_all.py
+        env:
+          # 只做离线校验，不调 API；给个占位值避免 .env 缺失导致的读取报错
+          DASHSCOPE_API_KEY: ci-placeholder

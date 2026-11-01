@@ -8,6 +8,7 @@ import time
 from rag.load_docs import load_all_docs, DOCS_DIR
 from rag.bm25 import BM25
 from rag.vector import VectorIndex
+from rag.refusal import check as check_refusal
 
 load_dotenv()
 
@@ -402,6 +403,37 @@ if prompt:
     st.chat_message("user").write(prompt)
     st.session_state.messages.append({"role":"user","content":prompt})
 
+    # ---- 能力边界拒答（W8）------------------------------------------------
+    # 规则命中就直接给指路话术，**不调模型**。
+    # 为什么放在调模型之前：这类问题的正确答案是一句固定的指路话术，
+    # 调模型既浪费 token，又给了它「编一个处理流程」的机会。
+    # 为什么用规则不用检索分数：实测两类题的余弦区间完全交叠，没有可用阈值
+    # （见 tools/calibrate_refusal.py 与 eval/reports/refusal_threshold.md）。
+    _deny = check_refusal(prompt)
+    if _deny:
+        _rule, _reply = _deny
+        st.chat_message("assistant").write(_reply)
+        st.session_state.messages.append({"role":"assistant","content":_reply})
+        log_request({
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "session": st.session_state.current_session,
+            "model": None,
+            "turn": len(st.session_state.messages),
+            "n_history": len(recent_messages(st.session_state.messages, MAX_HISTORY)),
+            "system_chars": 0,
+            "q": prompt,
+            "sources": [],
+            "refused": _rule,          # 命中的规则名，便于统计哪类拒答最多
+            "ok": True,
+            "error": None,
+            "answer": _reply,
+            "ttft_s": 0.0,
+            "total_s": 0.0,
+            "in_tokens": 0,
+            "out_tokens": 0,
+        })
+        st.caption(f"📌 能力边界：{_rule}（未调用模型）")
+        st.stop()
 
     # 与AI大模型进行交互
     # 用 replace 而不是 format：str.format 会把语料里的 {} 当作占位符去解析，

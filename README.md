@@ -34,8 +34,10 @@ data/raw/external_clean 301 篇外部语料（运行时按 --extra-dir 拼接）
 data/internal/          内部 SOP（物理隔离，绝不进 Prompt）
 eval/cases.jsonl        60 题评测集（54 事实 / 5 规则 / 1 边界，含 8 题封存留出集）
 eval/reports/           历次运行报告（失败运行标记 *_INVALID，不覆盖有效报告）
-tools/                  评测器与 12 个校验器
-docs/                   主轨计划 + 逐周过程记录
+rag/refusal.py          能力边界拒答：5 条规则 + 指路话术，不调模型
+tests/                  pytest：检索契约 + 拒答 + 12 个校验脚本回归（45 项）
+tools/                  评测器与 12 个校验器 + 拒答阈值标定
+docs/                   主轨计划 + 逐周过程记录 + 面试问答准备
 ```
 
 ---
@@ -47,16 +49,21 @@ docs/                   主轨计划 + 逐周过程记录
 copy .env.example .env
 :: 填入 DASHSCOPE_API_KEY，模型默认 qwen3.7-plus
 
-:: 2. 零成本自检（14 项，不调用 API）
+:: 2. 单元测试 + 检查回归（45 项，不调用 API）
+E:/guoxiaomi/.venv/Scripts/python.exe -m pip install -r requirements-dev.txt
+E:/guoxiaomi/.venv/Scripts/python.exe -m pytest
+
+:: 3. 零成本自检（14 项，不调用 API）
 E:/guoxiaomi/.venv/Scripts/python.exe tools/run_all.py
 
-:: 3. 检索侧评测（零 API 成本，测检索器本身）
+:: 4. 检索侧评测（零 API 成本，测检索器本身）
 E:/guoxiaomi/.venv/Scripts/python.exe tools/eval_retrieval.py
+E:/guoxiaomi/.venv/Scripts/python.exe tools/eval_hybrid.py --tier 45
 
-:: 4. 端到端评测（消耗 API 额度）
+:: 5. 端到端评测（消耗 API 额度）
 E:/guoxiaomi/.venv/Scripts/python.exe tools/eval_run.py --mode inject --mode bm25 --no-holdout
 
-:: 5. 启动应用
+:: 6. 启动应用
 E:/guoxiaomi/.venv/Scripts/python.exe -m streamlit run app.py
 ```
 
@@ -84,7 +91,8 @@ E:/guoxiaomi/.venv/Scripts/python.exe -m streamlit run app.py
 - 线上检索已接入，三档可切：`RETRIEVAL=vector`（默认，语义近似 top-3 篇）/ `bm25`（上一版，可回退）/ `off`（全量注入，A/B 对照）。system 由 33,211 字符降至 **5,780–6,160**（压缩 5.4–5.8 倍）
 - **线上只跑 45 篇**，且 45 篇档的最优策略与 346 篇档相反（45 篇降维只能到 45 维）。引用"融合最好"时必须注明是 346 篇档的结论
 - **线上索引只含冻结的 45 篇**。301 篇外部语料仅用于评测侧规模实验 —— 实测其异构噪声在块级 R@5 上不衰减，但在口语提问下会误命中（「这单能赔多少」命中《能力验证不合格怎么办》），且单篇长文可把 system 撑到 18.7K 字符。需要复现 346 档线上路径时设 `RETRIEVAL_EXTRA=data/raw/external_clean`
-- 无 pytest / CI、无 FastAPI / Docker、无 function calling（W8 / W9 / W12 计划中）
+- **拒答靠规则不靠分数**：实测库内/库外题的余弦区间完全交叠（0.479–0.992 vs 0.654–0.898），不存在可用阈值，改为 5 条能力边界规则（误拒 0/54，拦截 3/6 库外题，其余交给 prompt）
+- 无 FastAPI / Docker、无 function calling（W9 / W12 计划中）
 - 留出集 8 题的复述与金标抽检属本人所有权事项，尚未补完，故暂不引用留出集数字
 - 判据有两个已知缺陷：J1「查不到」误伤、J2 远距离否定剔除失效（已登记，未修）
 - 外部语料 301 篇只做运行时拼接，不参与冻结，因此 346 篇档指标不复现 45 篇档的历史基线
