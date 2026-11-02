@@ -56,11 +56,13 @@ VALID_EXPECT = ("has", "none", "constraint")
 # ======================================================================
 
 def _load_system_prompt():
-    # 从 app.py 提取 system_prompt 原文，并替换两个占位符。
-    src = open(os.path.join(PROJECT, "app.py"), encoding="utf-8").read()
-    m = re.search(r'system_prompt\s*=\s*"""(.*?)"""', src, re.S)
+    # 2026-11-02 起提示词唯一来源是 rag/prompt.py。
+    # 之前是「从 app.py 里正则抠出来」——能跑，但只要有人把提示词搬进常量或函数，
+    # 抠取就会静默失败或抠到半截；而且两份副本要靠 check_prompt 提醒人同步。
+    src = open(os.path.join(PROJECT, "rag", "prompt.py"), encoding="utf-8").read()
+    m = re.search(r'SYSTEM_PROMPT\s*=\s*"""(.*?)"""', src, re.S)
     if not m:
-        raise SystemExit("在 app.py 中找不到 system_prompt 的三引号定义")
+        raise SystemExit("在 rag/prompt.py 中找不到 SYSTEM_PROMPT 的三引号定义")
     return (m.group(1)
             .replace("{name}", "果小蜜")
             .replace("{character}", "热情、专业、懂生活、像闺蜜一样贴心"))

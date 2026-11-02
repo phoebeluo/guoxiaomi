@@ -12,7 +12,9 @@ import copy
 import os
 import sys
 
-APP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")
+PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT)
+APP = os.path.join(PROJECT, "app.py")
 
 WANT_FUNC = "recent_messages"
 WANT_CONST = "MAX_HISTORY"
@@ -70,7 +72,9 @@ def load_symbols(path):
 
     mod = ast.Module(body=keep, type_ignores=[])
     ast.fix_missing_locations(mod)
-    ns = {}
+    # 2026-11-02：app.py 的 recent_messages 改为调用 core，命名空间里必须补上
+    import core
+    ns = {"core": core}
     exec(compile(mod, path, "exec"), ns)
     return ns, src
 

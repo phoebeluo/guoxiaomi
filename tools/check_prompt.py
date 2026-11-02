@@ -32,7 +32,8 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT = os.path.dirname(HERE)
-APP = os.path.join(PROJECT, "app.py")
+# 2026-11-02 起提示词唯一来源是 rag/prompt.py（原先从 app.py 内联字符串抽取）
+PROMPT_FILE = os.path.join(PROJECT, "rag", "prompt.py")
 
 # 必须消失的表述：它们指向系统没有的能力，或诱导模型代客承诺
 FORBIDDEN = [
@@ -69,10 +70,10 @@ NEG_MARKERS = ("严禁", "不得", "不可", "不能", "无法", "杜绝", "禁�
 
 
 def main():
-    src = open(APP, encoding="utf-8").read()
-    m = re.search(r'system_prompt\s*=\s*"""(.*?)"""', src, re.S)
+    src = open(PROMPT_FILE, encoding="utf-8").read()
+    m = re.search(r'SYSTEM_PROMPT\s*=\s*"""(.*?)"""', src, re.S)
     if not m:
-        print("✗ 在 app.py 中找不到 system_prompt 的三引号定义")
+        print("✗ 在 rag/prompt.py 中找不到 SYSTEM_PROMPT 的三引号定义")
         return 1
     sp = m.group(1)
 

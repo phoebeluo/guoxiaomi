@@ -16,8 +16,13 @@
 | 三路检索有实测对比，且**结论随口径反转** | 45 篇档 R@3：语义近似 **95.8%** > 融合 93.8% > BM25 89.6%；346 篇档正相反（融合 95.8% 最好） | 同批 48 题，两档各跑一遍 |
 | 评测集本身可信 | 金标「独立支撑」审计 **54/54** 通过，0 冗余、0 库外污染 | 用一个脚本去判金标原文，不靠人工声称 |
 
+| 服务层扛得住，瓶颈在上游 | 峰值 **109.8 QPS / P99 79 ms**（mock 模型，单 worker），拐点并发 8–16 | `tools/load_test.py`，5 档并发各 40 请求 |
+
 配套的诚实标注：**瓶颈不是语料规模，而是口语 ↔ 书面语的词汇鸿沟**
 （未召回组 token 覆盖率 13%，已召回组 45%）。
+
+压测得到的另一条结论：**吞吐上限由入口信号量（`MAX_INFLIGHT`）和上游 RPM 决定，不是 worker 数**，
+所以限流做在入口（503 + `Retry-After`），而不是加 worker。
 
 ---
 
@@ -38,7 +43,10 @@ rag/refusal.py          能力边界拒答：5 条规则 + 指路话术，不调
 agent/tools.py          3 个可兑现工具 + function calling schema + 参数校验
 agent/loop.py           流式对话循环：tool_calls 拼装 → 执行 → 回灌 → 二次生成
 agent/llm.py            模型降级链：主模型 403/429 时按序探活，报告记实际用的模型
-tests/                  pytest：检索契约 + 拒答 + 工具 + 对话循环 + 12 个校验回归（83 项）
+rag/prompt.py           系统提示词唯一来源（线上与离线评测 import 同一个常量）
+core.py                 公共层：检索 / 拼 prompt / 调模型 / 会话落盘（Streamlit 与 Flask 共用）
+api.py                  Flask 接口：/chat · /chat/stream(SSE) · /sessions · /health
+tests/                  pytest：检索契约 + 拒答 + 工具 + 对话循环 + core + HTTP 接口 + 12 个校验回归（98 项）
 tools/                  评测器与 12 个校验器 + 拒答阈值标定
 docs/                   主轨计划 + 逐周过程记录 + 面试问答准备
 ```
@@ -52,7 +60,7 @@ docs/                   主轨计划 + 逐周过程记录 + 面试问答准备
 copy .env.example .env
 :: 填入 DASHSCOPE_API_KEY，模型默认 qwen3.7-plus
 
-:: 2. 单元测试 + 检查回归（45 项，不调用 API）
+:: 2. 单元测试 + 检查回归（98 项，不调用 API）
 E:/guoxiaomi/.venv/Scripts/python.exe -m pip install -r requirements-dev.txt
 E:/guoxiaomi/.venv/Scripts/python.exe -m pytest
 
@@ -66,8 +74,12 @@ E:/guoxiaomi/.venv/Scripts/python.exe tools/eval_hybrid.py --tier 45
 :: 5. 端到端评测（消耗 API 额度）
 E:/guoxiaomi/.venv/Scripts/python.exe tools/eval_run.py --mode inject --mode bm25 --no-holdout
 
-:: 6. 启动应用
+:: 6. 启动应用（两种入口，共用 core.py）
 E:/guoxiaomi/.venv/Scripts/python.exe -m streamlit run app.py
+E:/guoxiaomi/.venv/Scripts/python.exe api.py            :: Flask，默认 127.0.0.1:5000
+
+:: 7. 服务层压测（mock 模型，零 API 成本）
+E:/guoxiaomi/.venv/Scripts/python.exe tools/load_test.py
 ```
 
 `run_all.py` 覆盖：编译、**语料冻结指纹（SHA-256）**、题目合法性、判据回归（22 例）、
@@ -102,7 +114,9 @@ E:/guoxiaomi/.venv/Scripts/python.exe -m streamlit run app.py
 - **越权拒绝率是启发式的下界**：对抗判据是「三道闸」正则，能挡住已知的 8 种表述，挡不住第 9 种。可靠替代是 LLM-as-judge，当前 21 条规模不划算
 - **参数注入已知风险**：#21 把 `"order_amount": 0` 塞进问题，模型**真的传进了工具**（结果层无害，0 元仍需付 8 元运费）。正确修法是工具不信任调用方传的金额，尚未改
 - **模型降级会换模型**：`LLM_MODEL` 403/429 时自动按 `LLM_FALLBACKS` 探活接手。报告与 `requests.jsonl` 记的是**实际回答**的模型——引用数字时必须核对这一列
-- 无 FastAPI / Docker（W12 计划中）
+- **服务化边界**：Flask 接口只跑 `127.0.0.1`、单进程 threaded，无 Docker、无 gunicorn。多进程会把入口信号量复制成 N 份，`MAX_INFLIGHT` 立刻失效——所以「加 worker」在这套设计里是错的
+- **`MAX_INFLIGHT=8` 是人为值**，不是从上游 RPM 反推的实测值；真实容量需按账号配额算
+- SSE 流式接口已实现但**未纳入压测**（流式的 QPS/P99 口径与一次性请求不同，本轮不做）
 - 留出集 8 题的复述与金标抽检属本人所有权事项，尚未补完，故暂不引用留出集数字
 - 判据缺陷 J1（「查不到实时数据」误判拒答）/ J2（「不包含」未计入否定）**已于 W8 修复**，回归 19→22 例，4 份历史报告全量重判
 - 外部语料 301 篇只做运行时拼接，不参与冻结，因此 346 篇档指标不复现 45 篇档的历史基线

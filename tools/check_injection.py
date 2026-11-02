@@ -23,8 +23,11 @@ sys.path.insert(0, PROJECT)
 
 from rag.load_docs import load_all_docs, DOCS_DIR
 
+# 2026-11-02（W12）：提示词唯一来源改为 rag/prompt.py
 APP_PATH = PROJECT + "/app.py"
+PROMPT_PATH = PROJECT + "/rag/prompt.py"
 src = open(APP_PATH, encoding="utf-8").read()
+prompt_src = open(PROMPT_PATH, encoding="utf-8").read()
 
 
 def line(title):
@@ -51,7 +54,7 @@ for desc, ok in [
 
 
 line("二、离线复现 system_content 构造")
-m = re.search(r'system_prompt\s*=\s*"""(.*?)"""', src, re.S)
+m = re.search(r'SYSTEM_PROMPT\s*=\s*"""(.*?)"""', prompt_src, re.S)
 system_prompt = m.group(1)
 content, count, chars = load_all_docs(DOCS_DIR)
 

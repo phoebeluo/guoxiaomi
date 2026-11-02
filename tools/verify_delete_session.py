@@ -15,7 +15,9 @@ import shutil
 import sys
 import tempfile
 
-APP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")
+PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT)
+APP = os.path.join(PROJECT, "app.py")
 
 WANT_FUNCS = ["generate_session_name", "save_messages", "delete_session", "load_sessions"]
 
@@ -67,7 +69,8 @@ def load_symbols(path, names):
 
     mod = ast.Module(body=keep, type_ignores=[])
     ast.fix_missing_locations(mod)
-    ns = {"os": os, "json": json}
+    import core                      # 2026-11-02：app.py 的函数改为调用 core，命名空间里必须补上
+    ns = {"os": os, "json": json, "core": core}
     from datetime import datetime
     ns["datetime"] = datetime
     exec(compile(mod, path, "exec"), ns)
@@ -98,6 +101,10 @@ def main():
 
     tmp = tempfile.mkdtemp(prefix="gxm_verify_")
     ns["SESSIONS_DIR"] = tmp
+    # 2026-11-02：落盘已下沉到 core，重定向必须打在 core 上，
+    # 否则这个脚本会去动真实的 data/sessions —— 那比不测还糟
+    import core
+    core.SESSIONS_DIR = tmp
     fake_st = FakeSt()
     ns["st"] = fake_st
 
