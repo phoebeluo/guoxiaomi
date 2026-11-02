@@ -3,6 +3,12 @@ __pycache__/
 results/*.npy
 data/sessions/
 data/logs/
+
+# 会话库：是 data/sessions/ 的迁移目标，同样是运行时数据，不入库
+# -wal / -shm 是 WAL 模式的附属文件，一起忽略
+data/guoxiaomi.db
+data/guoxiaomi.db-wal
+data/guoxiaomi.db-shm
 .idea/
 *.pyc
 .venv/

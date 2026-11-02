@@ -41,6 +41,14 @@ DOCS_DIR = os.path.join(PROJECT, "data", "docs")
 SESSIONS_DIR = os.path.join(PROJECT, "data", "sessions")
 LOGS_DIR = os.path.join(PROJECT, "data", "logs")
 
+# SESSION_BACKEND: json（默认，JSON 文件）/ db（SQLite + SQLAlchemy）
+#
+# 为什么留开关而不是直接切：`app.py` 与 `api.py` 共用这 4 个函数，
+# 切存储是**横切改动**，一旦出问题无法判断是业务逻辑坏了还是存储坏了。
+# 留开关可以先让两套实现跑同一个测试集（`tests/test_core.py` 那段
+# save→list→load→delete 的不变式），对齐行为后再改默认值。
+SESSION_BACKEND = os.environ.get("SESSION_BACKEND", "json").lower()
+
 # 与 app.py 同口径的历史截断条数（10 条消息 = 5 轮）
 MAX_HISTORY = 10
 
@@ -222,13 +230,7 @@ def session_path(name):
     return os.path.join(SESSIONS_DIR, f"{name}.json")
 
 
-def save_session(name, messages, nickname="果小蜜",
-                 character="热情、专业、懂生活、像闺蜜一样贴心"):
-    """落盘一个会话。返回文件路径。
-
-    只做**整份覆盖**，不做增量追加：会话文件是「当前状态的快照」，
-    增量追加一旦中途失败会留下半条消息，读回来直接 400。
-    """
+def _save_session_json(name, messages, nickname, character):
     os.makedirs(SESSIONS_DIR, exist_ok=True)
     path = session_path(name)
     with open(path, "w", encoding="utf-8") as f:
@@ -238,7 +240,26 @@ def save_session(name, messages, nickname="果小蜜",
     return path
 
 
+def save_session(name, messages, nickname="果小蜜",
+                 character="热情、专业、懂生活、像闺蜜一样贴心"):
+    """落盘一个会话。返回文件路径（db 后端返回会话名）。
+
+    只做**整份覆盖**，不做增量追加：会话是「当前状态的快照」，
+    增量追加一旦中途失败会留下半条消息，读回来直接 400。
+
+    存储后端由 `SESSION_BACKEND` 决定；两套实现返回结构一致，
+    所以 `app.py` / `api.py` 一行不用改。
+    """
+    if SESSION_BACKEND == "db":
+        from db import store as db_store
+        return db_store.upsert_session(name, messages, nickname, character)
+    return _save_session_json(name, messages, nickname, character)
+
+
 def list_sessions():
+    if SESSION_BACKEND == "db":
+        from db import store as db_store
+        return db_store.list_session_names()
     if not os.path.exists(SESSIONS_DIR):
         return []
     names = [f[:-5] for f in os.listdir(SESSIONS_DIR) if f.endswith(".json")]
@@ -246,6 +267,9 @@ def list_sessions():
 
 
 def load_session(name):
+    if SESSION_BACKEND == "db":
+        from db import store as db_store
+        return db_store.get_session_dict(name)
     path = session_path(name)
     if not os.path.exists(path):
         raise FileNotFoundError(path)
@@ -254,6 +278,9 @@ def load_session(name):
 
 
 def delete_session(name):
+    if SESSION_BACKEND == "db":
+        from db import store as db_store
+        return db_store.delete_session(name)
     path = session_path(name)
     if os.path.exists(path):
         os.remove(path)
