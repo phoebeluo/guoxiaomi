@@ -652,17 +652,17 @@ def run(cases, modes, out_path):
     # 模型身份的唯一来源是 .env 的 LLM_MODEL。
     # 兜底：未配置时回退到 qwen3.7-plus，但**必须显式告警** ——
     # 静默回退会跑出「看起来正常、其实用错模型」的报告（指标管道骗人）。
-    # 2026-10-26 改：原兜底 qwen3.5-plus-2026-02-15 已 403 下线，回退到它等于必然失败。
-    model = os.environ.get("LLM_MODEL")
-    if not model:
-        model = "qwen3.7-plus"
-        print(f"⚠️ 未设置 LLM_MODEL，回退到 {model}"
-              f"（报告将以该模型名落档；建议在 .env 中显式指定）")
     client = OpenAI(
         api_key=os.environ.get("DASHSCOPE_API_KEY"),
         base_url=os.environ.get("DASHSCOPE_BASE_URL",
                                 "https://dashscope.aliyuncs.com/compatible-mode/v1"),
     )
+    # 2026-11-02 改：原兜底模型已 403 下线，单值写死 = 一个模型挂则整条评测停摆。
+    # 改为降级链（agent/llm.py），报告里的 model 字段一律是**实际**用上的那个。
+    from agent.llm import resolve as resolve_model
+    model, dropped = resolve_model(client)
+    if dropped:
+        print(f"⚠️ 降级：{'、'.join(dropped)} 不可用，本次使用 {model}")
 
     # 记录结果：results[策略key][题目id] = dict(ok, hits, refusals, answer)
     results = {m: {} for m in modes}
