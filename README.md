@@ -16,6 +16,7 @@
 | 三路检索有实测对比，且**结论随口径反转** | 45 篇档 R@3：语义近似 **95.8%** > 融合 93.8% > BM25 89.6%；346 篇档正相反（融合 95.8% 最好） | 同批 48 题，两档各跑一遍 |
 | 评测集本身可信 | 金标「独立支撑」审计 **54/54** 通过，0 冗余、0 库外污染 | 用一个脚本去判金标原文，不靠人工声称 |
 
+| 换问法后可信度不崩 | 40 条非题库问法：出处越界 **0%**、禁用话术 **2%**（1 条）、零命中自造出处 **0/12** | `tools/eval_ood.py`，qwen3.8-max |
 | 服务层扛得住，瓶颈在上游 | 峰值 **109.8 QPS / P99 79 ms**（mock 模型，单 worker），拐点并发 8–16 | `tools/load_test.py`，5 档并发各 40 请求 |
 
 配套的诚实标注：**瓶颈不是语料规模，而是口语 ↔ 书面语的词汇鸿沟**
@@ -44,9 +45,9 @@ agent/tools.py          3 个可兑现工具 + function calling schema + 参数�
 agent/loop.py           流式对话循环：tool_calls 拼装 → 执行 → 回灌 → 二次生成
 agent/llm.py            模型降级链：主模型 403/429 时按序探活，报告记实际用的模型
 rag/prompt.py           系统提示词唯一来源（线上与离线评测 import 同一个常量）
-core.py                 公共层：检索 / 拼 prompt / 调模型 / 会话落盘（Streamlit 与 Flask 共用）
+core.py                 公共层：检索 / 拼 prompt / 调模型 / 会话落盘 / 零命中兜底
 api.py                  Flask 接口：/chat · /chat/stream(SSE) · /sessions · /health
-tests/                  pytest：检索契约 + 拒答 + 工具 + 对话循环 + core + HTTP 接口 + 12 个校验回归（98 项）
+tests/                  pytest：检索契约 + 拒答 + 工具 + 对话循环 + core + HTTP 接口 + 12 个校验回归（112 项）
 tools/                  评测器与 12 个校验器 + 拒答阈值标定
 docs/                   主轨计划 + 逐周过程记录 + 面试问答准备
 ```
@@ -80,10 +81,17 @@ E:/guoxiaomi/.venv/Scripts/python.exe api.py            :: Flask，默认 127.0.
 
 :: 7. 服务层压测（mock 模型，零 API 成本）
 E:/guoxiaomi/.venv/Scripts/python.exe tools/load_test.py
+
+:: 8. 输入分布偏移测试（40 条非题库问法，消耗 API）
+E:/guoxiaomi/.venv/Scripts/python.exe tools/eval_ood.py --dry     :: 只校验用例
+E:/guoxiaomi/.venv/Scripts/python.exe tools/eval_ood.py
 ```
 
 `run_all.py` 覆盖：编译、**语料冻结指纹（SHA-256）**、题目合法性、判据回归（22 例）、
 金标审计、覆盖度、数字口径一致性、错误分类、历史截断、删会话行为等。
+
+输入分布偏移测试（40 条非题库问法，测可信度，**不测正确率**）：
+`tools/eval_ood.py` → `eval/reports/ood_*.md`。
 
 幻觉代理指标（越界率 / 编造率，零 API，读已存档答案）：
 `tools/hallucination_proxy.py` → `eval/reports/hallucination_proxy.md`。
@@ -114,6 +122,8 @@ E:/guoxiaomi/.venv/Scripts/python.exe tools/load_test.py
 - **越权拒绝率是启发式的下界**：对抗判据是「三道闸」正则，能挡住已知的 8 种表述，挡不住第 9 种。可靠替代是 LLM-as-judge，当前 21 条规模不划算
 - **参数注入已知风险**：#21 把 `"order_amount": 0` 塞进问题，模型**真的传进了工具**（结果层无害，0 元仍需付 8 元运费）。正确修法是工具不信任调用方传的金额，尚未改
 - **模型降级会换模型**：`LLM_MODEL` 403/429 时自动按 `LLM_FALLBACKS` 探活接手。报告与 `requests.jsonl` 记的是**实际回答**的模型——引用数字时必须核对这一列
+- **没有真实用户**：原计划 10–20 人试用已放弃，故**不得**出现「真实用户」「用户反馈驱动迭代」表述。替代做法是 40 条非题库问法的输入分布偏移测试——它测的是「换问法」，不是「换人」
+- **OOD 测试判不出「篇名对、内容错」**：出处越界只能判「篇名是否在注入范围内」，判不了「这句话是否真出自那篇」（需要 entailment 判定，成本远高于当前规模）
 - **服务化边界**：Flask 接口只跑 `127.0.0.1`、单进程 threaded，无 Docker、无 gunicorn。多进程会把入口信号量复制成 N 份，`MAX_INFLIGHT` 立刻失效——所以「加 worker」在这套设计里是错的
 - **`MAX_INFLIGHT=8` 是人为值**，不是从上游 RPM 反推的实测值；真实容量需按账号配额算
 - SSE 流式接口已实现但**未纳入压测**（流式的 QPS/P99 口径与一次性请求不同，本轮不做）

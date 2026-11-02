@@ -116,6 +116,12 @@ def _handle(session_id, message, nickname, character, stream):
     全包成 200 会让错误率永远是 0，那种压测没有意义。
     """
     system, sources = core.build_system_message(message, nickname, character)
+    # 零命中兜底（同 app.py）：检索不到资料就不调模型，给定稿话术。
+    # 这不是「省 token」的优化，是断掉编造路径——实测模型会无视知识块里的禁令。
+    if core.RETRIEVAL != "off" and not sources:
+        def _zero():
+            yield ("delta", core.zero_hit_reply(message))
+        return _zero(), [], "none(zero-hit)"
     history = []
     if session_id:
         try:

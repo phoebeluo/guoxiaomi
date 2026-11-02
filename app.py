@@ -291,6 +291,38 @@ if prompt:
     # replace 只精确替换这两个字符串，语料内容不会被误伤。
     # 语料拼在系统提示词之后、位于 messages 最前，保证前缀固定可命中 cache
     knowledge, sources = build_knowledge_block(prompt)
+
+    # ---- 零命中兜底（W13 输入分布偏移测试发现，2026-11-02）----------------
+    # 检索一篇都没命中 = 我手上没有任何资料。此时让模型开口只有风险：
+    #   第一版只给「请如实告知没有这项信息」→ 模型编出「满 199 减 20 / 299 减 35」
+    #   第二版改成禁止性指令「严禁给具体数字、严禁标来源」→ 数字没了，
+    #          但**仍然自造出处**「【来源：交易-促销活动规则】」（真实文件叫「优惠-限时活动与满减.md」）
+    # 所以改成代码层兜底：给定稿话术，不调模型。省一次调用，也彻底断掉编造路径。
+    if _MODE != "off" and not sources:
+        _reply = core.zero_hit_reply(prompt)
+        st.chat_message("assistant").write(_reply)
+        st.session_state.messages.append({"role": "assistant", "content": _reply})
+        log_request({
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "session": st.session_state.current_session,
+            "model": None,
+            "turn": len(st.session_state.messages),
+            "n_history": len(recent_messages(st.session_state.messages, MAX_HISTORY)),
+            "system_chars": 0,
+            "q": prompt,
+            "sources": [],
+            "zero_hit": True,
+            "ok": True,
+            "error": None,
+            "answer": _reply,
+            "ttft_s": 0.0,
+            "total_s": 0.0,
+            "in_tokens": 0,
+            "out_tokens": 0,
+        })
+        st.caption("📌 本轮检索未命中资料，未调用模型（避免编造）")
+        st.stop()
+
     system_content = (
         system_prompt
         .replace("{name}", st.session_state.nickname)
