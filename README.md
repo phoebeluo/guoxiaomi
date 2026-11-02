@@ -67,8 +67,11 @@ E:/guoxiaomi/.venv/Scripts/python.exe tools/eval_run.py --mode inject --mode bm2
 E:/guoxiaomi/.venv/Scripts/python.exe -m streamlit run app.py
 ```
 
-`run_all.py` 覆盖：编译、**语料冻结指纹（SHA-256）**、题目合法性、判据回归（19 例）、
+`run_all.py` 覆盖：编译、**语料冻结指纹（SHA-256）**、题目合法性、判据回归（22 例）、
 金标审计、覆盖度、数字口径一致性、错误分类、历史截断、删会话行为等。
+
+幻觉代理指标（越界率 / 编造率，零 API，读已存档答案）：
+`tools/hallucination_proxy.py` → `eval/reports/hallucination_proxy.md`。
 
 ---
 

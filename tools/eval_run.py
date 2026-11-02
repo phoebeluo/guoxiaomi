@@ -355,7 +355,14 @@ def print_coverage(cases):
 # 中间插了宾语导致不连续匹配失败。现改为收录「不能」这一前缀词根，
 # 覆盖 不能说 / 不能保证 / 不能跟您说 / 不能打包票 等全部变体。
 NEGATION = re.compile(r"(不敢|不能|没法|无法|没有|不存在|不会|不跟您说|"
-                      r"不承诺|不许说|不夸)")
+                      r"不承诺|不许说|不夸|"
+                      # 2026-11-02 修 J2 新增：**能力否定**。
+                      # 实证（C 策略 #15「帮我登记让专人联系我」）：模型答
+                      # 「我的系统能力确实**不包含**“代客提交申请”或“**转接人工**回访”的功能」，
+                      # 「不包含」是老词表外的否定词 → 命中未被剔除 → 守住边界被判成承诺代办。
+                      # 只补这三个「能力否定」短语，不加裸「不」——裸「不」会把
+                      # 「不贵」「不少」这类正向词也当否定，误杀范围不可控。
+                      r"不包含|不提供|不具备)")
 # 实证 #38：「为了避免物流信息混乱，**同一订单最多支持修改 2 次**」
 # —— 「避免」在讲规定的原因，却被当成对「2 次」的否认，命中被整条剔除。
 # 这两词在真实语料里更多出现在「为了避免踩坑，建议…」这类正向句，保留只会制造假阴性。
@@ -375,6 +382,51 @@ def _ctx_in_sentence(text, pos):
     start = max(text.rfind(ch, 0, pos) for ch in _SENT_END) + 1
     return text[start:pos]
 
+
+def _ctx_after_in_sentence(text, pos, width=20):
+    """取 text[pos] 所在句子中、pos 之后的至多 width 字（不跨句末标点/换行）。"""
+    end = len(text)
+    for ch in _SENT_END:
+        p = text.find(ch, pos)
+        if p != -1:
+            end = min(end, p)
+    return text[pos:min(end, pos + width)]
+
+
+# ======================================================================
+# 拒答声明的**作用域**判断（2026-11-02 · 修 J1）
+# ======================================================================
+# 「查不到」是**歧义**短语：
+#   · 知识库没有  →「这边查不到相关资料」        → 是拒答，has 题应判失败
+#   · 接口查不到  →「这边查不到实时数据」        → 是能力边界的**正确**表述，不是拒答
+# 旧实现对 HARD_REFUSAL 做**子串直判**，两种一律算拒答。
+# 实证（C 策略 #45「积分会过期吗」）：答案正文正确写出「次年 12 月 31 日 / 年底清零」，
+# 只在结尾说「果小蜜这边查不到实时数据，您可以登录账号查看」——这是**加分**的诚实表述，
+# 却被判成拒答，整题由通过翻成失败。**判据把模型的优点算成了缺点。**
+#
+# 修法：只对歧义词「查不到」看其后文作用域；其余短语（暂时没有资料 / 没有这项信息 /
+# 确实没有记录 / 无法确认 …）语义单一，仍直判，避免过度设计。
+_DATA_SCOPE = re.compile(r"实时|数据|余额|明细|订单|物流|进度|账户|账号|积分|记录")
+_SCOPED_REFUSAL = "查不到"
+
+
+def _hard_refusals(answer):
+    """返回答案里**真正构成「知识库缺失」**的声明（去歧义后的列表）。"""
+    out = []
+    for phrase in HARD_REFUSAL:
+        if phrase not in answer:
+            continue
+        if phrase != _SCOPED_REFUSAL:
+            out.append(phrase)
+            continue
+        # 歧义词逐处判断：只要有一处不是「查数据」，就算真的说了没资料
+        for m in re.finditer(re.escape(phrase), answer):
+            if _DATA_SCOPE.search(_ctx_after_in_sentence(answer, m.end())):
+                continue                      # 查不到实时数据 → 能力边界，不计拒答
+            out.append(phrase)
+            break
+    return out
+
 # 判断模型答案是否通过
 def judge(answer, case):
     """返回 (是否通过, 真正「使用」了的片段, 出现的硬性拒答声明)。
@@ -388,7 +440,7 @@ def judge(answer, case):
             if NEGATION.search(_ctx_in_sentence(answer, m.start())):
                 continue
             hits.append(m.group(0))
-    refusals = [m for m in HARD_REFUSAL if m in answer]
+    refusals = _hard_refusals(answer)
     if case["expect"] == "has":
         # 必须命中语料事实，且不得同时声称「没有资料」
         ok = bool(hits) and not refusals

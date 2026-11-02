@@ -11,7 +11,7 @@
   1. py_compile      —— 全部 .py 能否编译
   2. 语料冻结指纹    —— data/docs/ 是否被动过（SHA-256）
   3. eval_run --check—— 题目字段与正则合法性
-  4. test_judge      —— 判据回归（19 例）
+  4. test_judge      —— 判据回归（22 例）
   5. check_kinds     —— kind/expect 搭配与分母分组
   6. check_prompt    —— 提示词是否残留"指向不存在能力"的表述
   7. check_injection —— 离线复现 system 消息构造
