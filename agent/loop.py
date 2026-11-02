@@ -99,13 +99,16 @@ def stream_chat(client, model, messages, tools=None, max_rounds=MAX_ROUNDS,
             try:
                 args = json.loads(c["arguments"] or "{}")
             except json.JSONDecodeError:
+                args = None
                 out = {"ok": False, "error_code": "BAD_JSON",
                        "message": f"参数不是合法 JSON：{c['arguments'][:60]}"}
             else:
                 out = safe_dispatch(c["name"], args)
-            results.append((cid, c["name"], out))
+            results.append((cid, c["name"], args or {}, out))
 
-        yield ("tools", [{"name": n, "result": o} for _, n, o in results])
+        # args 一并带出去：W11 要统计「参数正确率」，
+        # 只看结果判不出「参数错但恰好返回成功」的情况。
+        yield ("tools", [{"name": n, "args": a, "result": o} for _, n, a, o in results])
 
         # 回灌：assistant 的 tool_calls + 每个工具的 tool 消息
         msgs.append({
@@ -114,10 +117,10 @@ def stream_chat(client, model, messages, tools=None, max_rounds=MAX_ROUNDS,
             "tool_calls": [
                 {"id": cid, "type": "function",
                  "function": {"name": n, "arguments": c["arguments"] or "{}"}}
-                for (cid, n, _), c in zip(results, ordered)
+                for (cid, n, _, _), c in zip(results, ordered)
             ],
         })
-        for cid, n, o in results:
+        for cid, n, _, o in results:
             msgs.append({
                 "role": "tool",
                 "tool_call_id": cid,

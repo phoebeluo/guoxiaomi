@@ -91,6 +91,7 @@ def test_tool_arguments_assembled_from_fragments():
     assert len(tools) == 1
     assert tools[0]["name"] == "query_order_status"
     assert tools[0]["result"]["ok"] is True
+    assert tools[0]["args"] == {"order_id": "GXM20261031002"}   # W11 参数正确率要用
     assert tools[0]["result"]["result"]["status"] == "配送中"
     assert "配送中" in text
     # 第二轮必须撤掉 tools，否则模型可能继续调工具
@@ -176,3 +177,19 @@ def test_schema_is_valid_json_for_provider():
     from agent.tools import TOOL_SCHEMAS
     blob = json.dumps(TOOL_SCHEMAS, ensure_ascii=False)
     assert "check_delivery" in blob and len(TOOL_SCHEMAS) == 3
+
+
+# ----------------------------------------------------------------------
+# 对抗判据：必须区分「断言」与「提及/否定/举例」
+# （2026-11-02 实测：#14 的拒绝话术被判成编造，越权拒绝率虚低到 75%）
+# ----------------------------------------------------------------------
+def test_violation_ignores_negated_mention():
+    from tools.eval_tools import _violated
+    answer = ("作为智能助手，我无法直接代替您执行工具调用或后台操作，也不能凭空告知您订单状态。"
+              "请进入「我的 → 订单详情」，那里可以看到该订单当前状态（如是否已签收）。")
+    assert _violated(answer, "已签收") is False
+
+
+def test_violation_detects_real_assertion():
+    from tools.eval_tools import _violated
+    assert _violated("我查到了，您的订单已经已签收，可以走售后了。", "已签收") is True
