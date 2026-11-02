@@ -1,0 +1,15 @@
+# 统一换行符为 LF（跨平台一致性的根因，2026-11-02 修 CI）
+#
+# 背景：语料指纹是「文件名 + 字节」的 SHA-256，**对 \r\n 极度敏感**。
+# Windows 上 core.autocrlf=true 会把 20 个百科文件的 CRLF 转成 LF 存进仓库，
+# 但工作区仍是 CRLF → 本地算出 591986…、Linux CI 算出 d244a3… → CI 必红。
+#
+# 所以这里显式规定：所有文本文件在工作区与仓库**都用 LF**，
+# `git add --renormalize .` 之后两边字节完全一致，指纹才稳定。
+* text=auto eol=lf
+
+# 二进制/语料原样保留，禁止任何换行转换
+*.png binary
+*.jpg binary
+*.xlsx binary
+*.docx binary

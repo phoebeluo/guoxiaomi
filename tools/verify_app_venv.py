@@ -8,7 +8,7 @@
 import os
 import sys
 
-PROJECT = r"E:\guoxiaomi"
+PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(PROJECT)
 sys.path.insert(0, PROJECT)
 

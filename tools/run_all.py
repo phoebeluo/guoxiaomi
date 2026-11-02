@@ -46,7 +46,7 @@ PROJECT = os.path.dirname(HERE)
 PY = sys.executable
 
 # 语料冻结指纹（总纲 7.8 末；若 data/docs/ 变更，这里**必须**由人确认后更新）
-DOCS_SHA256 = "591986c81ddbee2aca7909d5e0dd084e0098997292f5334efbdf1fd71e7495f8"
+DOCS_SHA256 = "d244a3af107a629f7bf0cbce4f3f0d62f736b20bafdd727c2b7033536c27dfd0"
 DOCS_EXPECT_COUNT = 45
 DOCS_EXPECT_CHARS = 29563
 

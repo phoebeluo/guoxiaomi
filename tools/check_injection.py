@@ -11,10 +11,14 @@ Step 2 注入验证脚本
 运行：python check_injection.py
 """
 
+import os
 import re
 import sys
 
-PROJECT = r"E:/guoxiaomi"
+# 2026-11-02 修 CI：原来写死 r"E:/guoxiaomi"，在 Linux runner 上 sys.path 里是条
+# 不存在的路径 → `from rag...` 直接 ModuleNotFoundError。改为按文件位置推导。
+HERE = os.path.dirname(os.path.abspath(__file__))
+PROJECT = os.path.dirname(HERE)
 sys.path.insert(0, PROJECT)
 
 from rag.load_docs import load_all_docs, DOCS_DIR
