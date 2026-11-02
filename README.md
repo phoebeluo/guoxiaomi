@@ -36,7 +36,8 @@ eval/cases.jsonl        60 题评测集（54 事实 / 5 规则 / 1 边界，含 
 eval/reports/           历次运行报告（失败运行标记 *_INVALID，不覆盖有效报告）
 rag/refusal.py          能力边界拒答：5 条规则 + 指路话术，不调模型
 agent/tools.py          3 个可兑现工具 + function calling schema + 参数校验
-tests/                  pytest：检索契约 + 拒答 + 工具 + 12 个校验脚本回归（68 项）
+agent/loop.py           流式对话循环：tool_calls 拼装 → 执行 → 回灌 → 二次生成
+tests/                  pytest：检索契约 + 拒答 + 工具 + 对话循环 + 12 个校验回归（77 项）
 tools/                  评测器与 12 个校验器 + 拒答阈值标定
 docs/                   主轨计划 + 逐周过程记录 + 面试问答准备
 ```

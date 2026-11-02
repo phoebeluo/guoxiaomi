@@ -9,6 +9,8 @@ from rag.load_docs import load_all_docs, DOCS_DIR
 from rag.bm25 import BM25
 from rag.vector import VectorIndex
 from rag.refusal import check as check_refusal
+from agent.loop import stream_chat
+from agent.tools import TOOL_SCHEMAS
 
 load_dotenv()
 
@@ -180,6 +182,10 @@ if _MODE not in ("vector", "bm25", "off"):
     _MODE = "vector"
 TOPK = 3
 
+# 工具开关（2026-11-02 · W9）
+# TOOLS=on（默认）→ 带 3 个工具的 schema 调模型；off → 退回纯 RAG（W8 行为），A/B 对照用
+_TOOLS = os.environ.get("TOOLS", "on").strip().lower() != "off"
+
 # 外部语料**默认不进线上索引**（2026-10-29 实测决定）：
 #   加上 301 篇后，命中一篇法规长文就能把 system 从 5.6K 撑到 18.7K 字符，
 #   且口语提问（如「这单能赔多少」）会被「如何处理」之类的虚词拉去命中《能力验证不合格怎么办》
@@ -336,8 +342,9 @@ system_prompt="""
 - **不越权承诺**: 不得承诺未经确认的金额与时效，如"今天肯定能到""明天一定给您补发""老板特批给您免单"。涉及金额与时效的承诺一律以公开政策为准，不可自行加码。
 - **健康类必须加免责**: 涉及孕妇、婴幼儿、慢性病患者、正在服药人群的食用建议，必须附上"这部分建议您咨询专业医生，果小蜜只能提供水果本身的常识哦～"。
 - **不贬低竞品**: 只强调自身产品的优势，不主动攻击其他商家或水果品种。
-- **保持人设**: 始终记住自己是"果小蜜"，不要跳出角色回答与水果销售无关的问题。涉及天气、订单、物流状态等实时信息时，如实告知你无法实时查询，不得用话术回避，也不得说“帮您查一下”“稍后告诉您”这类话。
+- **保持人设**: 始终记住自己是"果小蜜"，不要跳出角色回答与水果销售无关的问题。涉及天气等本系统没有数据源的信息时，如实告知无法查询；**订单状态可以用工具查到**（见下条），物流轨迹仍无法告知，让对方到「我的 → 订单详情」查看。不得用话术回避，也不得说“帮您查一下”“稍后告诉您”这类空承诺。
 - **必须标出处**: 凡依据下方知识库作答的内容，须在对应结论后括注篇名，格式 `【来源：篇名】`，多篇并列如 `【来源：A、B】`。**凡知识库中没有依据的内容，一律不得标注来源**，按「不知道就明说」处理。出处是给顾客核对依据用的，编造篇名比不给来源更糟。
+- **能用工具就用工具**（2026-11-02 起）: 你接了三个工具——查配送范围与运费、算会员等级、查订单状态。问题落在三件事上时**必须先调用工具**，用工具返回的事实回答，不要凭知识库印象推断。工具返回 `ok=false` 时，按它给的 message 如实告知（例如「这个订单号查不到」），**严禁猜一个状态**。工具的排序与时效以工具返回为准。【来源：】只用于知识库内容，工具结论不需要标注篇名。
 - **出处只能来自本轮看到的篇名**: 你下方「知识库全文」里实际出现了哪几篇，就只能标哪几篇。**正文里出现的书名号交叉引用（例如「详见《售后-坏果赔付政策》」）不是你已经读到的文档**，不得把它当作来源标注 —— 标了就等于声称你读过一篇你没读过的文件，顾客拿这句话去核对时会被误导。"""
 
 # 标题
@@ -475,41 +482,35 @@ if prompt:
     t0 = time.perf_counter()
     first_chunk_at = None
     usage = None
+    tool_traces = []
     try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_content},
-                *hist,
-            ],
-            stream=True,
-            # 思考链默认关闭。qwen3.7-max 这类模型思考默认开，output 是 36 元/百万
-            # （input 12 元/百万的 3 倍），而果小蜜是「角色扮演式水果导购」，
-            # 不需要思维链 —— 实测关掉后 completion token 从 172 降到 20。
-            # 若模型不支持该参数会报 400，此时删掉这一行即可（行为等同默认）。
-            extra_body={"enable_thinking": False},
-            # 让服务端在流末尾多带一个只含用量信息的数据包（usage）。
-            # 这是运行时能拿到 token 数的唯一途径；若模型不支持会报 400，
-            # 删掉这一行即可（行为等同默认），其余记录字段仍然可用。
-            stream_options={"include_usage": True},
-        )
-
-        # 输出
+        # 2026-11-02（W9）：模型调用统一走 agent/loop.py 的流式对话循环。
+        # 它比裸调多两件事：① 本轮带 function calling schema ② 收到 tool_calls 后
+        # 执行工具、把结构化结果回灌、再跑一轮生成。不需要工具的提问行为完全不变
+        # （仍是逐字流式），所以这不影响绝大多数问答的体验与延迟。
         with st.chat_message("assistant"):
-            response_message=st.empty()
+            response_message = st.empty()
             full_response = ""
-            for chunk in response:
-                # 判空：流式响应中部分数据包的 choices 可能为空列表
-                # （例如开启 stream_options.include_usage 后，最后一个数据包只带用量信息）
-                if chunk.choices and chunk.choices[0].delta.content is not None:
-                    content=chunk.choices[0].delta.content
+            for kind, payload in stream_chat(
+                client,
+                model,
+                [{"role": "system", "content": system_content}, *hist],
+                tools=TOOL_SCHEMAS if _TOOLS else None,
+                extra_body={"enable_thinking": False},
+            ):
+                if kind == "delta":
                     if first_chunk_at is None:
                         first_chunk_at = time.perf_counter()   # 首个正文 token 的时刻
-                    full_response+=content
+                    full_response += payload
                     response_message.write(full_response)
-                # 末尾那个只带 usage 的数据包：choices 为空，但 usage 有值
-                if getattr(chunk, "usage", None):
-                    usage = chunk.usage
+                elif kind == "tools":
+                    tool_traces.extend(payload)
+                elif kind == "usage":
+                    usage = payload          # dict：prompt_tokens / completion_tokens
+            if tool_traces:
+                names = "、".join(t["name"] for t in tool_traces)
+                ok = all(t["result"].get("ok") for t in tool_traces)
+                st.caption(f"🔧 已调用工具：{names}" + ("" if ok else "（返回失败，已如实告知）"))
 
     except Exception as e:
         # 出错不把异常抛给用户：换成一句降级话术，并把错误分类落进记录。
